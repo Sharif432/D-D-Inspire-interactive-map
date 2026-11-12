@@ -1,0 +1,1498 @@
+import React, { useState, useEffect, useRef } from "react";
+import { 
+  CampaignState, 
+  Character, 
+  JournalNote, 
+  DiceRollResult, 
+  LocationType, 
+  InitiativeCombatant, 
+  SiteBattleMap, 
+  CampaignLocation 
+} from "./types";
+import { 
+  BookOpen, 
+  Compass, 
+  Dices, 
+  Plus, 
+  Trash2, 
+  RefreshCw, 
+  Scroll, 
+  Heart, 
+  UserPlus, 
+  Edit2,
+  Swords, 
+  LayoutGrid, 
+  Laptop,
+  Check,
+  X,
+  Upload,
+  Image as ImageIcon,
+  Shield,
+  Clock,
+  Sun
+} from "lucide-react";
+import MapInterface from "./components/MapInterface";
+import DiceRoller from "./components/DiceRoller";
+import InitiativeOrder from "./components/InitiativeOrder";
+import StandaloneModal from "./components/StandaloneModal";
+import { motion, AnimatePresence } from "motion/react";
+
+export default function App() {
+  const [state, setState] = useState<CampaignState | null>(null);
+  const [selectedCharacterId, setSelectedCharacterId] = useState<string>("valerius");
+  const [activeTab, setActiveTab] = useState<"map" | "dice" | "journal">("map");
+  const [diceSubView, setDiceSubView] = useState<"tactical" | "initiative" | "roller">("tactical");
+  const [isLoading, setIsLoading] = useState(true);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isStandaloneModalOpen, setIsStandaloneModalOpen] = useState(false);
+
+  // Campaign & Party Metadata editing
+  const [isEditingCampaignMeta, setIsEditingCampaignMeta] = useState(false);
+  const [campaignNameInput, setCampaignNameInput] = useState("");
+  const [partyNameInput, setPartyNameInput] = useState("");
+
+  // Character Editor State (Easy editing of name, picture, class, race, hp, stats)
+  const [editingCharacter, setEditingCharacter] = useState<Character | null>(null);
+  const [editCharName, setEditCharName] = useState("");
+  const [editCharClass, setEditCharClass] = useState("");
+  const [editCharRace, setEditCharRace] = useState("");
+  const [editCharLevel, setEditCharLevel] = useState<number>(1);
+  const [editCharCurrentHp, setEditCharCurrentHp] = useState<number>(10);
+  const [editCharMaxHp, setEditCharMaxHp] = useState<number>(10);
+  const [editCharAvatarUrl, setEditCharAvatarUrl] = useState("");
+  const [editCharStats, setEditCharStats] = useState({
+    strength: 10,
+    dexterity: 10,
+    constitution: 10,
+    intelligence: 10,
+    wisdom: 10,
+    charisma: 10
+  });
+  const charFileInputRef = useRef<HTMLInputElement>(null);
+
+  // New Hero addition state
+  const [isAddingHero, setIsAddingHero] = useState(false);
+  const [heroName, setHeroName] = useState("");
+  const [heroClass, setHeroClass] = useState("");
+  const [heroRace, setHeroRace] = useState("");
+  const [heroAvatarUrl, setHeroAvatarUrl] = useState("");
+  const heroFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Journal adding state
+  const [newNoteTitle, setNewNoteTitle] = useState("");
+  const [newNoteContent, setNewNoteContent] = useState("");
+  const [newNoteCategory, setNewNoteCategory] = useState<"quest" | "lore" | "session" | "loot">("session");
+  const [noteFilter, setNoteFilter] = useState<string>("all");
+
+  // Fetch complete campaign state
+  const fetchCampaign = async (showLoader = false) => {
+    if (showLoader) setIsLoading(true);
+    try {
+      const res = await fetch("/api/campaign");
+      if (!res.ok) throw new Error("Failed to fetch campaign data");
+      const data = await res.json();
+      setState(data);
+      if (!campaignNameInput && data.campaignName) setCampaignNameInput(data.campaignName);
+      if (!partyNameInput && data.partyName) setPartyNameInput(data.partyName);
+    } catch (err: any) {
+      console.error(err);
+      setErrorMessage("Error sync. Ensure backend is running.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Poll state every 4.5 seconds for multi-device sync
+  useEffect(() => {
+    fetchCampaign(true);
+    const interval = setInterval(() => {
+      fetchCampaign(false);
+    }, 4500);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Update Campaign & Party Names
+  const handleSaveCampaignMeta = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const res = await fetch("/api/campaign/meta", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          campaignName: campaignNameInput.trim() || "Aethelgard",
+          partyName: partyNameInput.trim() || "Campaign Party Alliance"
+        })
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+        setIsEditingCampaignMeta(false);
+      }
+    } catch (err) {
+      console.error("Save campaign meta error:", err);
+    }
+  };
+
+  // Sync Party Traveling
+  const handleMoveParty = async (locationId: string) => {
+    try {
+      const res = await fetch("/api/campaign/move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targetLocationId: locationId })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Move party failure:", err);
+    }
+  };
+
+  // Toggle Discovered / Dynamic Hidden logic
+  const handleToggleDiscovered = async (locationId: string) => {
+    try {
+      const res = await fetch("/api/campaign/location/toggle-discovered", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ locationId })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Toggle location state error:", err);
+    }
+  };
+
+  // DM Tool: Create Custom Landmark/Hidden Point on Canvas
+  const handleCreateLocation = async (locData: { name: string; description: string; type: LocationType; x: number; y: number; isHidden: boolean }) => {
+    try {
+      const res = await fetch("/api/campaign/location/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(locData)
+      });
+      const data = await res.json();
+      if (data.success) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Creation err:", err);
+    }
+  };
+
+  // Save / Update Battle Maps for a Location
+  const handleSaveBattleMaps = async (locationId: string, interiorMaps: SiteBattleMap[], activeInteriorMapId: string) => {
+    try {
+      const res = await fetch("/api/campaign/location/battlemap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ locationId, interiorMaps, activeInteriorMapId })
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Save battle maps error:", err);
+    }
+  };
+
+  // Update Region / Big Map Background Image
+  const handleUpdateRegionImage = async (regionId: string, imageUrl: string) => {
+    try {
+      const res = await fetch("/api/campaign/region/image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ regionId, imageUrl })
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Update region image failure:", err);
+    }
+  };
+
+  // Update Location (Name, Description, Type, X, Y, Danger, Image, Condition, Boss Slain, Hidden)
+  const handleUpdateLocation = async (location: Partial<CampaignLocation> & { id: string }) => {
+    try {
+      const res = await fetch("/api/campaign/location/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ location })
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Update location error:", err);
+    }
+  };
+
+  // Delete Location from Campaign Map
+  const handleDeleteLocation = async (locationId: string) => {
+    try {
+      const res = await fetch("/api/campaign/location/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ locationId })
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Delete location error:", err);
+    }
+  };
+
+  // Toggle Boss Slain on Location (Crimson X on Map)
+  const handleToggleBossSlain = async (locationId: string) => {
+    try {
+      const res = await fetch("/api/campaign/location/toggle-boss-slain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ locationId })
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Toggle boss slain error:", err);
+    }
+  };
+
+  // Toggle Hidden from Players (DM Eyes Only)
+  const handleToggleHidden = async (locationId: string) => {
+    try {
+      const res = await fetch("/api/campaign/location/toggle-hidden", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ locationId })
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Toggle hidden error:", err);
+    }
+  };
+
+  // Open Edit Character Modal
+  const openEditCharacter = (char: Character) => {
+    setEditingCharacter(char);
+    setEditCharName(char.name);
+    setEditCharClass(char.className);
+    setEditCharRace(char.race);
+    setEditCharLevel(char.level);
+    setEditCharCurrentHp(char.hp.current);
+    setEditCharMaxHp(char.hp.max);
+    setEditCharAvatarUrl(char.avatarUrl || "");
+    setEditCharStats(char.stats || {
+      strength: 10,
+      dexterity: 10,
+      constitution: 10,
+      intelligence: 10,
+      wisdom: 10,
+      charisma: 10
+    });
+  };
+
+  // Save Character Changes
+  const handleSaveCharacterEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingCharacter) return;
+
+    const updatedChar: Character = {
+      ...editingCharacter,
+      name: editCharName.trim() || editingCharacter.name,
+      className: editCharClass.trim() || editingCharacter.className,
+      race: editCharRace.trim() || editingCharacter.race,
+      level: Math.max(1, Number(editCharLevel) || 1),
+      hp: {
+        current: Math.max(0, Math.min(Number(editCharMaxHp), Number(editCharCurrentHp))),
+        max: Math.max(1, Number(editCharMaxHp) || 10)
+      },
+      avatarUrl: editCharAvatarUrl,
+      stats: editCharStats
+    };
+
+    try {
+      const res = await fetch("/api/campaign/character", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updatedChar)
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+        setEditingCharacter(null);
+      }
+    } catch (err) {
+      console.error("Save character error:", err);
+    }
+  };
+
+  // Delete Character
+  const handleDeleteCharacter = async (charId: string) => {
+    if (!window.confirm("Remove this hero from the party alliance?")) return;
+    try {
+      const res = await fetch("/api/campaign/character/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ characterId: charId })
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+        if (selectedCharacterId === charId && data.campaign.characters.length > 0) {
+          setSelectedCharacterId(data.campaign.characters[0].id);
+        }
+        setEditingCharacter(null);
+      }
+    } catch (err) {
+      console.error("Delete character error:", err);
+    }
+  };
+
+  // Character Avatar file upload
+  const handleCharAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>, isNewHero = false) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const dataUrl = event.target?.result as string;
+      if (dataUrl) {
+        if (isNewHero) {
+          setHeroAvatarUrl(dataUrl);
+        } else {
+          setEditCharAvatarUrl(dataUrl);
+        }
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Add a Custom Hero to the Table
+  const handleAddHero = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!heroName || !heroClass) return;
+
+    const randomStat = () => Math.floor(Math.random() * 8) + 10;
+
+    const customChar: Character = {
+      id: "hero_" + Date.now(),
+      name: heroName.trim(),
+      race: heroRace.trim() || "Human",
+      className: heroClass.trim(),
+      level: 1,
+      hp: { current: 18, max: 18 },
+      stats: {
+        strength: randomStat(),
+        dexterity: randomStat(),
+        constitution: randomStat(),
+        intelligence: randomStat(),
+        wisdom: randomStat(),
+        charisma: randomStat()
+      },
+      voice: "Zephyr",
+      avatarUrl: heroAvatarUrl || "https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?auto=format&fit=crop&q=80&w=200"
+    };
+
+    try {
+      const res = await fetch("/api/campaign/character", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(customChar)
+      });
+      const data = await res.json();
+      if (data.success) {
+        setState(data.campaign);
+        setSelectedCharacterId(customChar.id);
+        setHeroName("");
+        setHeroClass("");
+        setHeroRace("");
+        setHeroAvatarUrl("");
+        setIsAddingHero(false);
+      }
+    } catch (err) {
+      console.error("Hero add error:", err);
+    }
+  };
+
+  // Cloud Journal: Synchronize Note Submissions
+  const handleAddNote = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newNoteTitle || !newNoteContent) return;
+
+    try {
+      const res = await fetch("/api/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: newNoteTitle,
+          content: newNoteContent,
+          authorCharacterId: selectedCharacterId,
+          category: newNoteCategory
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setState(data.campaign);
+        setNewNoteTitle("");
+        setNewNoteContent("");
+      }
+    } catch (err) {
+      console.error("Note submit error:", err);
+    }
+  };
+
+  const handleDeleteNote = async (id: string) => {
+    try {
+      const res = await fetch(`/api/notes/${id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.success) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Delete note error:", err);
+    }
+  };
+
+  // Dice rolls tracker sync logic
+  const handleAddRollResult = async (roll: DiceRollResult) => {
+    try {
+      const res = await fetch("/api/dice/log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(roll)
+      });
+      const data = await res.json();
+      if (data.success) {
+        setState(prev => prev ? { ...prev, recentRolls: data.recentRolls } : null);
+      }
+    } catch (err) {
+      console.error("Roll sync error:", err);
+    }
+  };
+
+  // Sync Initiative Order combat state across devices
+  const handleSaveInitiative = async (order: InitiativeCombatant[], round: number, turnIndex: number) => {
+    try {
+      const res = await fetch("/api/campaign/initiative", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          initiativeOrder: order,
+          initiativeRound: round,
+          currentTurnIndex: turnIndex
+        })
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.warn("Initiative save failure:", err);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-[#0c0e12] flex flex-col items-center justify-center p-6 text-center">
+        <div className="space-y-4">
+          <RefreshCw className="w-12 h-12 text-amber-500 animate-spin mx-auto" />
+          <h2 className="text-2xl font-serif italic text-white tracking-widest uppercase">Consulting Lore Grimoire</h2>
+          <p className="text-xs font-mono text-slate-500 max-w-xs leading-relaxed">
+            Constructing nested multi-level maps, party rosters, and tabletop chambers...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!state) {
+    return (
+      <div className="min-h-screen bg-[#0c0e12] flex flex-col items-center justify-center p-6 text-center">
+        <p className="text-red-400 font-mono mb-2">CRITICAL DEVICE OFFLINE ERROR</p>
+        <p className="text-xs text-slate-400">Unable to establish connection to Campaign Server API.</p>
+        <button 
+          onClick={() => fetchCampaign(true)}
+          className="mt-4 px-4 py-2 bg-amber-600 text-white rounded text-xs uppercase cursor-pointer"
+        >
+          Retry Connection Setup
+        </button>
+      </div>
+    );
+  }
+
+  const activeRegion = state.regions.find(r => r.id === state.currentRegionId) || state.regions[0];
+  const activeChar = state.characters.find(c => c.id === selectedCharacterId) || state.characters[0];
+  const campaignTitle = state.campaignName || "Aethelgard";
+  const partyAllianceName = state.partyName || "Campaign Party Alliance";
+
+  const filteredNotes = noteFilter === "all" 
+    ? state.notes 
+    : state.notes.filter(n => n.category === noteFilter);
+
+  return (
+    <div className="min-h-screen bg-[#0c0e12] text-[#d1d5db] font-sans flex flex-col overflow-x-hidden selection:bg-amber-500 selection:text-black">
+      
+      {/* HEADER BANNER - EDITABLE CAMPAIGN NAME & NAVIGATION */}
+      <header className="h-20 shrink-0 border-b border-white/10 bg-[#0f1117] flex items-center justify-between px-4 sm:px-6 lg:px-8 shadow-md">
+        <div className="flex items-center gap-3 sm:gap-6 min-w-0">
+          {/* Editable Campaign Title */}
+          <div className="flex flex-col min-w-0">
+            <div className="flex items-center space-x-1.5 group cursor-pointer" onClick={() => setIsEditingCampaignMeta(true)}>
+              <h1 className="text-xl sm:text-2xl lg:text-3xl font-serif italic text-amber-500 tracking-tighter leading-none truncate hover:text-amber-400 transition-colors">
+                {campaignTitle}
+              </h1>
+              <Edit2 className="w-3.5 h-3.5 text-slate-500 group-hover:text-amber-400 transition-colors shrink-0" title="Click to rename campaign and party" />
+            </div>
+            <span className="text-[9px] uppercase tracking-widest text-slate-400 font-mono mt-0.5 truncate">
+              {partyAllianceName}
+            </span>
+          </div>
+
+          <div className="h-8 w-px bg-white/10 hidden md:block"></div>
+          
+          <div className="hidden md:flex flex-col">
+            <span className="text-[9px] uppercase tracking-widest text-amber-500/60 font-mono font-bold">Active Territory</span>
+            <span className="text-xs font-medium text-slate-200 flex items-center gap-1.5">
+              <Compass className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+              {activeRegion.name}
+            </span>
+          </div>
+        </div>
+
+        {/* Tab switcher */}
+        <div className="flex items-center space-x-2">
+          <div className="bg-[#151722] p-1 rounded-lg border border-white/5 flex space-x-1">
+            <button
+              onClick={() => setActiveTab("map")}
+              className={`px-3 py-1.5 rounded text-xs uppercase tracking-wider font-mono transition-all cursor-pointer ${
+                activeTab === "map" ? "bg-amber-500 text-black font-semibold" : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              Interactive Map
+            </button>
+            <button
+              onClick={() => setActiveTab("dice")}
+              className={`px-3 py-1.5 rounded text-xs uppercase tracking-wider font-mono transition-all cursor-pointer flex items-center gap-1.5 ${
+                activeTab === "dice" ? "bg-amber-500 text-black font-semibold" : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Dices className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Dice & Initiative</span>
+            </button>
+            <button
+              onClick={() => setActiveTab("journal")}
+              className={`px-3 py-1.5 rounded text-xs uppercase tracking-wider font-mono transition-all cursor-pointer ${
+                activeTab === "journal" ? "bg-amber-500 text-black font-semibold" : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              Live Journal
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2.5 ml-2 sm:ml-4">
+            <button
+              onClick={() => setIsStandaloneModalOpen(true)}
+              className="flex items-center space-x-1.5 px-3 py-1.5 bg-gradient-to-r from-amber-500/15 to-amber-600/10 hover:from-amber-500/25 hover:to-amber-600/20 border border-amber-500/40 hover:border-amber-400 text-amber-300 rounded-lg text-xs font-mono transition-all cursor-pointer shadow-sm"
+              title="Download standalone desktop app (.exe & .zip) to run on your computer"
+            >
+              <Laptop className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline font-bold">Standalone App & Saves</span>
+              <span className="sm:hidden font-bold">.EXE</span>
+            </button>
+
+            <div className="hidden lg:flex items-center gap-1 bg-emerald-950/40 border border-emerald-500/20 text-emerald-400 text-[10px] uppercase tracking-widest px-2.5 py-1 rounded-full font-mono font-semibold">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse inline-block" />
+              Auto-Sync
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* CORE WORKSPACE PANELS */}
+      <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
+        
+        {/* LEFT WORKSPACE SIDEBAR - THE D&D PARTY ROSTER (EASILY MODIFIABLE) */}
+        <aside className="w-full lg:w-80 shrink-0 border-r border-white/5 bg-[#0f1117] flex flex-col overflow-y-auto">
+          
+          {/* Party list heading with Party Name editing */}
+          <div className="p-4 border-b border-white/5 bg-black/10 flex items-center justify-between">
+            <div className="flex items-center space-x-1.5 group cursor-pointer" onClick={() => setIsEditingCampaignMeta(true)}>
+              <h2 className="text-[11px] uppercase tracking-widest text-amber-500 font-bold font-mono truncate max-w-[170px]">
+                {partyAllianceName}
+              </h2>
+              <Edit2 className="w-3 h-3 text-slate-500 group-hover:text-amber-400 transition-colors" />
+            </div>
+
+            <button
+              onClick={() => setIsAddingHero(!isAddingHero)}
+              className="text-[10px] uppercase font-mono text-slate-400 hover:text-amber-500 flex items-center gap-1 border border-white/10 px-2.5 py-1 rounded-lg transition-all cursor-pointer bg-white/5"
+            >
+              <UserPlus className="w-3 h-3 text-amber-400" />
+              <span>Add Hero</span>
+            </button>
+          </div>
+
+          {/* Hero addition tray */}
+          <AnimatePresence>
+            {isAddingHero && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                className="overflow-hidden bg-[#13151f] border-b border-white/5 p-4 space-y-3 font-mono text-xs"
+              >
+                <div className="text-[10px] text-amber-500 font-bold uppercase tracking-wider flex items-center justify-between">
+                  <span>Recruit Quest Adventurer</span>
+                  <button onClick={() => setIsAddingHero(false)} className="text-slate-400 hover:text-white">✕</button>
+                </div>
+
+                <form onSubmit={handleAddHero} className="space-y-2.5">
+                  <input
+                    type="text"
+                    required
+                    placeholder="Hero Name (e.g., Kaelen Shadowthorn)"
+                    value={heroName}
+                    onChange={(e) => setHeroName(e.target.value)}
+                    className="w-full bg-[#1c1e29] border border-white/10 text-slate-200 p-2 rounded text-xs focus:outline-none focus:border-amber-500"
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      required
+                      placeholder="Class (e.g. Rogue)"
+                      value={heroClass}
+                      onChange={(e) => setHeroClass(e.target.value)}
+                      className="bg-[#1c1e29] border border-white/10 text-slate-200 p-2 rounded text-xs focus:outline-none focus:border-amber-500"
+                    />
+                    <input
+                      type="text"
+                      placeholder="Race (e.g. Elf)"
+                      value={heroRace}
+                      onChange={(e) => setHeroRace(e.target.value)}
+                      className="bg-[#1c1e29] border border-white/10 text-slate-200 p-2 rounded text-xs focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+
+                  {/* Hero Portrait Picture Upload */}
+                  <div>
+                    <label className="block text-[9px] uppercase font-mono text-slate-400 mb-1">
+                      Hero Portrait Picture
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="url"
+                        placeholder="Image URL https://..."
+                        value={heroAvatarUrl}
+                        onChange={(e) => setHeroAvatarUrl(e.target.value)}
+                        className="flex-1 bg-[#1c1e29] border border-white/10 text-slate-200 px-2 py-1.5 rounded text-xs font-mono"
+                      />
+                      <input
+                        type="file"
+                        ref={heroFileInputRef}
+                        accept="image/*"
+                        onChange={(e) => handleCharAvatarUpload(e, true)}
+                        className="hidden"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => heroFileInputRef.current?.click()}
+                        className="px-2.5 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded text-3xs font-mono text-slate-300 cursor-pointer flex items-center gap-1"
+                      >
+                        <Upload className="w-3 h-3 text-amber-400" />
+                        <span>Upload</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="w-full py-2 bg-amber-500 hover:bg-amber-400 text-black font-bold uppercase text-[10px] tracking-wider transition-all rounded cursor-pointer"
+                  >
+                    Deploy Hero to Party
+                  </button>
+                </form>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Character Profiles list with easy Modification buttons */}
+          <div className="p-4 space-y-3.5 flex-1">
+            {state.characters.map((char) => {
+              const isSelected = char.id === selectedCharacterId;
+              const hpPercent = Math.min(100, Math.floor((char.hp.current / char.hp.max) * 100));
+
+              return (
+                <div
+                  key={char.id}
+                  onClick={() => setSelectedCharacterId(char.id)}
+                  className={`relative p-3.5 rounded-xl border transition-all cursor-pointer group ${
+                    isSelected
+                      ? "bg-[#14161f] border-amber-500/40 shadow-lg"
+                      : "bg-[#10121a]/85 border-white/5 hover:border-white/15"
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center space-x-1.5">
+                        <span className="font-serif text-lg italic text-white tracking-tight truncate">{char.name}</span>
+                        {char.id === "dm" && (
+                          <span className="bg-red-950/80 text-red-400 border border-red-500/30 text-[8px] uppercase font-mono px-1 rounded">DM</span>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-slate-400 font-mono italic truncate">
+                        Lvl {char.level} — {char.race} {char.className}
+                      </p>
+                    </div>
+
+                    {/* Avatar Portrait with Quick Edit Pencil */}
+                    <div className="relative shrink-0">
+                      <div className="w-10 h-10 rounded-full overflow-hidden border border-white/20 bg-[#1e2029] flex items-center justify-center font-serif text-sm text-amber-500 font-bold shadow">
+                        {char.avatarUrl ? (
+                          <img src={char.avatarUrl} alt={char.name} className="object-cover w-full h-full" />
+                        ) : (
+                          char.name[0]
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Character health bars */}
+                  {char.id !== "dm" && (
+                    <div className="mt-2.5 space-y-1">
+                      <div className="flex justify-between text-[9px] font-mono text-slate-400">
+                        <span className="flex items-center gap-1">
+                          <Heart className="w-3 h-3 text-red-400" />
+                          Vitality
+                        </span>
+                        <span className="font-bold text-slate-200">{char.hp.current} / {char.hp.max} HP</span>
+                      </div>
+                      <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
+                        <div 
+                          className={`h-full transition-all ${hpPercent > 50 ? "bg-amber-500" : hpPercent > 20 ? "bg-orange-500" : "bg-red-500"}`}
+                          style={{ width: `${hpPercent}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Easy Action Bar: Edit Character Button */}
+                  <div className="mt-3 pt-2.5 border-t border-white/5 flex items-center justify-between text-[10px]">
+                    <div className="flex items-center space-x-2 text-3xs font-mono text-slate-400">
+                      <span>STR {char.stats?.strength || 10}</span>
+                      <span>DEX {char.stats?.dexterity || 10}</span>
+                      <span>CON {char.stats?.constitution || 10}</span>
+                    </div>
+
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openEditCharacter(char);
+                      }}
+                      className="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 hover:text-white border border-amber-500/30 rounded text-[9px] font-mono uppercase flex items-center gap-1 transition-all cursor-pointer"
+                      title="Edit hero name, picture, class, HP and stats"
+                    >
+                      <Edit2 className="w-2.5 h-2.5 text-amber-400" />
+                      <span>Edit Hero</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Quick Party Summary */}
+          <div className="p-4 border-t border-white/5 bg-[#12141d] text-2xs font-mono text-slate-400 flex items-center justify-between">
+            <span>Alliance: {state.characters.length} Adventurers</span>
+            <button
+              onClick={() => setIsEditingCampaignMeta(true)}
+              className="text-amber-400 hover:underline flex items-center gap-1"
+            >
+              <Edit2 className="w-2.5 h-2.5" />
+              Rename Party
+            </button>
+          </div>
+        </aside>
+
+        {/* CENTER COMPONENT - SWITCHABLE TAB TILES */}
+        <main className="flex-1 flex flex-col relative overflow-y-auto">
+          {activeTab === "map" && (
+            <div className="flex-1 p-3 sm:p-4 lg:p-6 min-h-0 flex flex-col">
+              <MapInterface
+                campaignState={state}
+                onMoveParty={handleMoveParty}
+                onToggleDiscovered={handleToggleDiscovered}
+                onCreateLocation={handleCreateLocation}
+                onSaveBattleMaps={handleSaveBattleMaps}
+                onUpdateRegionImage={handleUpdateRegionImage}
+                onUpdateLocation={handleUpdateLocation}
+                onDeleteLocation={handleDeleteLocation}
+                onToggleBossSlain={handleToggleBossSlain}
+                onToggleHidden={handleToggleHidden}
+              />
+            </div>
+          )}
+
+          {activeTab === "dice" && (
+            <div className="flex-1 p-3 sm:p-4 lg:p-6 flex flex-col space-y-4 min-h-0 overflow-y-auto">
+              
+              {/* Tactical View Mode Switcher */}
+              <div className="flex flex-wrap items-center justify-between gap-3 bg-[#0f1117] border border-white/10 p-3 rounded-xl shadow-lg shrink-0">
+                <div className="flex items-center space-x-2">
+                  <div className="bg-[#151722] p-1 rounded-lg border border-white/5 flex space-x-1 text-xs font-mono">
+                    <button
+                      onClick={() => setDiceSubView("tactical")}
+                      className={`px-3 py-1.5 rounded transition-all cursor-pointer flex items-center space-x-1.5 ${
+                        diceSubView === "tactical"
+                          ? "bg-amber-500 text-black font-bold"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      <LayoutGrid className="w-3.5 h-3.5" />
+                      <span>Tactical Split View</span>
+                    </button>
+                    <button
+                      onClick={() => setDiceSubView("initiative")}
+                      className={`px-3 py-1.5 rounded transition-all cursor-pointer flex items-center space-x-1.5 ${
+                        diceSubView === "initiative"
+                          ? "bg-amber-500 text-black font-bold"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      <Swords className="w-3.5 h-3.5" />
+                      <span>Initiative Order</span>
+                    </button>
+                    <button
+                      onClick={() => setDiceSubView("roller")}
+                      className={`px-3 py-1.5 rounded transition-all cursor-pointer flex items-center space-x-1.5 ${
+                        diceSubView === "roller"
+                          ? "bg-amber-500 text-black font-bold"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      <Dices className="w-3.5 h-3.5" />
+                      <span>Rolling Chamber</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Quick Combat Status Indicator */}
+                <div className="flex items-center space-x-2 text-2xs font-mono">
+                  {state.initiativeOrder && state.initiativeOrder.length > 0 ? (
+                    <div className="flex items-center space-x-2 bg-amber-500/10 border border-amber-500/30 text-amber-400 px-3 py-1 rounded-full">
+                      <Swords className="w-3 h-3 text-amber-500 animate-pulse" />
+                      <span>Encounter Active • Round {state.initiativeRound || 1}</span>
+                    </div>
+                  ) : (
+                    <span className="text-slate-500 hidden sm:inline">
+                      ⚔️ Ready for encounter setup
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Tactical View */}
+              {diceSubView === "tactical" && (
+                <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 min-h-0 flex-1">
+                  <div className="xl:col-span-7 flex flex-col min-h-[500px]">
+                    <InitiativeOrder
+                      characters={state.characters}
+                      selectedCharacterId={selectedCharacterId}
+                      onSelectCharacter={setSelectedCharacterId}
+                      onAddRollResult={handleAddRollResult}
+                      savedInitiativeOrder={state.initiativeOrder}
+                      savedRound={state.initiativeRound}
+                      savedTurnIndex={state.currentTurnIndex}
+                      onSaveInitiative={handleSaveInitiative}
+                    />
+                  </div>
+
+                  <div className="xl:col-span-5 flex flex-col space-y-6">
+                    <div className="shrink-0">
+                      <DiceRoller
+                        characters={state.characters}
+                        selectedCharacterId={selectedCharacterId}
+                        onSelectCharacter={setSelectedCharacterId}
+                        recentRolls={state.recentRolls}
+                        onAddRollResult={handleAddRollResult}
+                        onOpenInitiative={() => setDiceSubView("initiative")}
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Full Initiative View */}
+              {diceSubView === "initiative" && (
+                <div className="flex-1 flex flex-col min-h-[550px]">
+                  <InitiativeOrder
+                    characters={state.characters}
+                    selectedCharacterId={selectedCharacterId}
+                    onSelectCharacter={setSelectedCharacterId}
+                    onAddRollResult={handleAddRollResult}
+                    savedInitiativeOrder={state.initiativeOrder}
+                    savedRound={state.initiativeRound}
+                    savedTurnIndex={state.currentTurnIndex}
+                    onSaveInitiative={handleSaveInitiative}
+                  />
+                </div>
+              )}
+
+              {/* Rolling Chamber View */}
+              {diceSubView === "roller" && (
+                <div className="flex-1">
+                  <DiceRoller
+                    characters={state.characters}
+                    selectedCharacterId={selectedCharacterId}
+                    onSelectCharacter={setSelectedCharacterId}
+                    recentRolls={state.recentRolls}
+                    onAddRollResult={handleAddRollResult}
+                    onOpenInitiative={() => setDiceSubView("initiative")}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === "journal" && (
+            <div className="flex-1 p-4 lg:p-8 flex flex-col space-y-6">
+              <div className="flex flex-col md:flex-row gap-6">
+                
+                {/* Note Writer */}
+                <div className="w-full md:w-80 space-y-4 shrink-0">
+                  <div className="bg-[#0f1117] border border-white/10 rounded-xl p-5 space-y-4">
+                    <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-amber-500">
+                      Sync Note Writer
+                    </h3>
+
+                    <form onSubmit={handleAddNote} className="space-y-3 text-xs">
+                      <div>
+                        <label className="block text-[10px] uppercase font-mono text-slate-400 mb-1">
+                          Chronicle Header
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          placeholder="e.g. Map of Wave Echo Cave"
+                          value={newNoteTitle}
+                          onChange={(e) => setNewNoteTitle(e.target.value)}
+                          className="w-full bg-[#161822] border border-white/5 p-2 rounded focus:outline-none focus:border-amber-500 font-sans text-slate-100"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="block text-[10px] uppercase font-mono text-slate-400 mb-1">
+                            Chronicle Author
+                          </label>
+                          <span className="block bg-[#161822] border border-white/5 p-2 rounded text-amber-400 font-bold truncate">
+                            {activeChar ? activeChar.name.split(" ")[0] : "Dungeon Master"}
+                          </span>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] uppercase font-mono text-slate-400 mb-1">
+                            Classification
+                          </label>
+                          <select
+                            value={newNoteCategory}
+                            onChange={(e) => setNewNoteCategory(e.target.value as any)}
+                            className="bg-[#161822] border border-white/5 p-2 rounded text-slate-200 focus:outline-none focus:border-amber-500 w-full"
+                          >
+                            <option value="session">🕯️ Session</option>
+                            <option value="quest">📜 Quests</option>
+                            <option value="lore">📚 Lore Book</option>
+                            <option value="loot">🪙 Gold / Loot</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] uppercase font-mono text-slate-400 mb-1">
+                          Chronicle Contents
+                        </label>
+                        <textarea
+                          rows={4}
+                          required
+                          placeholder="Type notes for the party to see on their devices instantly..."
+                          value={newNoteContent}
+                          onChange={(e) => setNewNoteContent(e.target.value)}
+                          className="w-full bg-[#161822] border border-white/5 p-2 rounded focus:outline-none focus:border-amber-500 font-sans text-slate-100"
+                        />
+                      </div>
+
+                      <button
+                        type="submit"
+                        className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-black font-mono font-bold uppercase text-xs rounded transition-all flex items-center justify-center space-x-1.5 cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>Replicate to Devices</span>
+                      </button>
+                    </form>
+                  </div>
+                </div>
+
+                {/* Chronicle Journal List */}
+                <div className="flex-1 space-y-4">
+                  <div className="flex items-center justify-between border-b border-white/10 pb-3">
+                    <div className="flex items-center space-x-2">
+                      <BookOpen className="w-4.5 h-4.5 text-amber-500" />
+                      <h3 className="text-xs font-bold uppercase tracking-widest text-[#d1d5db]">
+                        Campaign Chronicle Ledger
+                      </h3>
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-500 uppercase">
+                      {filteredNotes.length} logs
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {filteredNotes.length === 0 ? (
+                      <div className="md:col-span-2 text-center py-20 bg-white/2 border border-white/5 rounded-xl text-slate-500 font-mono text-xs">
+                        No notes recorded yet.
+                      </div>
+                    ) : (
+                      filteredNotes.map((note) => {
+                        const author = state.characters.find(c => c.id === note.authorCharacterId);
+
+                        return (
+                          <div 
+                            key={note.id}
+                            className="bg-[#0f1117] border border-white/10 rounded-xl p-5 hover:border-amber-500/35 transition-all flex flex-col justify-between space-y-4 shadow"
+                          >
+                            <div className="space-y-2">
+                              <div className="flex items-center justify-between text-4xs font-mono text-slate-500">
+                                <span className="uppercase text-amber-500/80 px-1.5 py-0.5 bg-amber-500/5 rounded border border-amber-500/10">
+                                  {note.category}
+                                </span>
+                                <span>{new Date(note.createdAt).toLocaleDateString()}</span>
+                              </div>
+
+                              <h4 className="font-serif italic text-lg text-white leading-tight font-semibold tracking-tight">
+                                {note.title}
+                              </h4>
+                              
+                              <p className="text-xs text-slate-300 font-serif leading-relaxed whitespace-pre-line block">
+                                "{note.content}"
+                              </p>
+                            </div>
+
+                            <div className="pt-3 border-t border-white/5 flex items-center justify-between">
+                              <span className="text-3xs text-slate-500 font-mono flex items-center gap-1.5">
+                                Scribe: <span className="text-slate-300 font-bold uppercase">{author ? author.name.split(" ")[0] : "DM"}</span>
+                              </span>
+
+                              <button
+                                onClick={() => handleDeleteNote(note.id)}
+                                className="text-slate-500 hover:text-red-400 p-1 rounded hover:bg-red-950/20 transition-all cursor-pointer"
+                                title="Delete note"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+
+      {/* FOOTER BAR */}
+      <footer className="h-10 border-t border-white/10 bg-[#0c0e12] px-6 flex items-center justify-between text-[10px] font-mono text-slate-500 select-none shrink-0">
+        <div className="flex items-center space-x-4">
+          <span className="flex items-center gap-1">
+            <Clock className="w-3 h-3 text-amber-500" />
+            Session Time: {new Date().toLocaleTimeString()}
+          </span>
+          <span className="hidden md:inline">•</span>
+          <span className="hidden md:flex items-center gap-1">
+            <Sun className="w-3 h-3 text-yellow-500" />
+            Atmosphere: Twilight in Faerûn
+          </span>
+        </div>
+        
+        <div>
+          <span>D&D Interactive Campaign Companion © 2026</span>
+        </div>
+      </footer>
+
+      {/* ========================================================= */}
+      {/* MODAL: EDIT CAMPAIGN & PARTY NAMES */}
+      {/* ========================================================= */}
+      <AnimatePresence>
+        {isEditingCampaignMeta && (
+          <div className="fixed inset-0 z-60 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="w-full max-w-md bg-[#0f111a] border border-amber-500/40 rounded-2xl p-5 shadow-2xl space-y-4 font-sans text-slate-200"
+            >
+              <div className="flex items-center justify-between border-b border-white/10 pb-3">
+                <div className="flex items-center space-x-2">
+                  <Edit2 className="w-5 h-5 text-amber-500" />
+                  <h3 className="text-base font-serif italic text-white font-bold">
+                    Edit Campaign & Party Titles
+                  </h3>
+                </div>
+                <button
+                  onClick={() => setIsEditingCampaignMeta(false)}
+                  className="text-slate-400 hover:text-white"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form onSubmit={handleSaveCampaignMeta} className="space-y-4">
+                <div>
+                  <label className="block text-2xs uppercase font-mono text-amber-400 font-bold mb-1">
+                    Campaign Name
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={campaignNameInput}
+                    onChange={(e) => setCampaignNameInput(e.target.value)}
+                    placeholder="e.g. Aethelgard / Curse of Strahd / Lost Mine"
+                    className="w-full bg-[#161824] border border-white/10 text-white p-2.5 rounded-lg text-sm focus:outline-none focus:border-amber-500 font-serif italic"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-2xs uppercase font-mono text-amber-400 font-bold mb-1">
+                    Party Alliance Name
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={partyNameInput}
+                    onChange={(e) => setPartyNameInput(e.target.value)}
+                    placeholder="e.g. The Silver Hand / The Wandering Troupe"
+                    className="w-full bg-[#161824] border border-white/10 text-white p-2.5 rounded-lg text-sm focus:outline-none focus:border-amber-500 font-serif italic"
+                  />
+                </div>
+
+                <div className="flex justify-end gap-2 pt-2 border-t border-white/10">
+                  <button
+                    type="button"
+                    onClick={() => setIsEditingCampaignMeta(false)}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-mono cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-5 py-2 bg-amber-500 hover:bg-amber-400 text-black font-mono font-bold text-xs uppercase rounded-lg transition-colors cursor-pointer"
+                  >
+                    Save Titles
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ========================================================= */}
+      {/* MODAL: EDIT CHARACTER / HERO (NAME, PICTURE, CLASS, HP, STATS) */}
+      {/* ========================================================= */}
+      <AnimatePresence>
+        {editingCharacter && (
+          <div className="fixed inset-0 z-60 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="w-full max-w-lg bg-[#0f111a] border border-amber-500/40 rounded-2xl p-5 shadow-2xl space-y-4 font-sans text-slate-200 max-h-[92vh] overflow-y-auto"
+            >
+              <div className="flex items-center justify-between border-b border-white/10 pb-3">
+                <div className="flex items-center space-x-2">
+                  <Edit2 className="w-5 h-5 text-amber-500" />
+                  <h3 className="text-base font-serif italic text-white font-bold">
+                    Edit Hero Profile: {editingCharacter.name}
+                  </h3>
+                </div>
+                <button
+                  onClick={() => setEditingCharacter(null)}
+                  className="text-slate-400 hover:text-white"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form onSubmit={handleSaveCharacterEdit} className="space-y-4">
+                {/* Hero Avatar & Upload */}
+                <div className="flex items-center space-x-4 bg-[#141624] p-3 rounded-xl border border-white/5">
+                  <div className="w-16 h-16 rounded-full overflow-hidden border-2 border-amber-500 shrink-0 bg-black/50 shadow">
+                    {editCharAvatarUrl ? (
+                      <img src={editCharAvatarUrl} alt="Preview" className="w-full h-full object-cover" />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center font-serif text-xl text-amber-400 font-bold">
+                        {editCharName ? editCharName[0] : "?"}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex-1 space-y-1.5 min-w-0">
+                    <label className="block text-2xs uppercase font-mono text-amber-400 font-bold">
+                      Character Picture (Upload or URL)
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="url"
+                        placeholder="Image URL https://..."
+                        value={editCharAvatarUrl}
+                        onChange={(e) => setEditCharAvatarUrl(e.target.value)}
+                        className="flex-1 bg-[#1a1d2e] border border-white/10 text-white px-2.5 py-1 rounded text-xs font-mono"
+                      />
+                      <input
+                        type="file"
+                        ref={charFileInputRef}
+                        accept="image/*"
+                        onChange={(e) => handleCharAvatarUpload(e, false)}
+                        className="hidden"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => charFileInputRef.current?.click()}
+                        className="px-3 py-1 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 rounded text-xs font-mono flex items-center gap-1 cursor-pointer"
+                      >
+                        <Upload className="w-3.5 h-3.5" />
+                        <span>Upload</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Name, Class & Race */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-2xs uppercase font-mono text-slate-400 font-bold mb-1">
+                      Hero Name
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={editCharName}
+                      onChange={(e) => setEditCharName(e.target.value)}
+                      className="w-full bg-[#161824] border border-white/10 text-white p-2 rounded-lg text-xs focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-2xs uppercase font-mono text-slate-400 font-bold mb-1">
+                      Class
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={editCharClass}
+                      onChange={(e) => setEditCharClass(e.target.value)}
+                      className="w-full bg-[#161824] border border-white/10 text-white p-2 rounded-lg text-xs focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-2xs uppercase font-mono text-slate-400 font-bold mb-1">
+                      Race
+                    </label>
+                    <input
+                      type="text"
+                      value={editCharRace}
+                      onChange={(e) => setEditCharRace(e.target.value)}
+                      className="w-full bg-[#161824] border border-white/10 text-white p-2 rounded-lg text-xs focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                </div>
+
+                {/* Level, HP and Quick HP adjust */}
+                <div className="bg-[#141624] p-3 rounded-xl border border-white/5 space-y-2">
+                  <div className="grid grid-cols-3 gap-3">
+                    <div>
+                      <label className="block text-2xs uppercase font-mono text-slate-400 font-bold mb-1">
+                        Hero Level
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={30}
+                        value={editCharLevel}
+                        onChange={(e) => setEditCharLevel(parseInt(e.target.value) || 1)}
+                        className="w-full bg-[#1a1d2e] border border-white/10 text-white p-1.5 rounded text-xs text-center font-mono"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-2xs uppercase font-mono text-red-400 font-bold mb-1">
+                        Current HP
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={editCharMaxHp}
+                        value={editCharCurrentHp}
+                        onChange={(e) => setEditCharCurrentHp(parseInt(e.target.value) || 0)}
+                        className="w-full bg-[#1a1d2e] border border-red-500/40 text-red-300 p-1.5 rounded text-xs text-center font-mono font-bold"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-2xs uppercase font-mono text-slate-400 font-bold mb-1">
+                        Max HP
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={editCharMaxHp}
+                        onChange={(e) => setEditCharMaxHp(parseInt(e.target.value) || 1)}
+                        className="w-full bg-[#1a1d2e] border border-white/10 text-white p-1.5 rounded text-xs text-center font-mono font-bold"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Quick HP Adjustment Buttons */}
+                  <div className="flex items-center justify-between pt-1 text-3xs font-mono">
+                    <span className="text-slate-400">Quick Vitality:</span>
+                    <div className="flex gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setEditCharCurrentHp(prev => Math.max(0, prev - 5))}
+                        className="px-2 py-0.5 bg-red-950/80 hover:bg-red-900 border border-red-500/40 text-red-300 rounded cursor-pointer"
+                      >
+                        -5
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditCharCurrentHp(prev => Math.max(0, prev - 1))}
+                        className="px-2 py-0.5 bg-red-950/80 hover:bg-red-900 border border-red-500/40 text-red-300 rounded cursor-pointer"
+                      >
+                        -1
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditCharCurrentHp(prev => Math.min(editCharMaxHp, prev + 1))}
+                        className="px-2 py-0.5 bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-emerald-300 rounded cursor-pointer"
+                      >
+                        +1
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditCharCurrentHp(prev => Math.min(editCharMaxHp, prev + 5))}
+                        className="px-2 py-0.5 bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-emerald-300 rounded cursor-pointer"
+                      >
+                        +5
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditCharCurrentHp(editCharMaxHp)}
+                        className="px-2 py-0.5 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 rounded cursor-pointer font-bold"
+                      >
+                        Full
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Ability Scores (STR, DEX, CON, INT, WIS, CHA) */}
+                <div>
+                  <label className="block text-2xs uppercase font-mono text-slate-400 font-bold mb-1.5">
+                    Ability Scores
+                  </label>
+                  <div className="grid grid-cols-6 gap-2 text-center font-mono">
+                    {[
+                      { key: "strength", label: "STR" },
+                      { key: "dexterity", label: "DEX" },
+                      { key: "constitution", label: "CON" },
+                      { key: "intelligence", label: "INT" },
+                      { key: "wisdom", label: "WIS" },
+                      { key: "charisma", label: "CHA" }
+                    ].map(stat => {
+                      const val = (editCharStats as any)[stat.key] || 10;
+                      const mod = Math.floor((val - 10) / 2);
+                      const modStr = mod >= 0 ? `+${mod}` : `${mod}`;
+
+                      return (
+                        <div key={stat.key} className="bg-[#161824] p-1.5 rounded-lg border border-white/5">
+                          <span className="text-3xs text-slate-400 block font-bold">{stat.label}</span>
+                          <input
+                            type="number"
+                            min={1}
+                            max={30}
+                            value={val}
+                            onChange={(e) => {
+                              const v = parseInt(e.target.value) || 10;
+                              setEditCharStats(prev => ({ ...prev, [stat.key]: v }));
+                            }}
+                            className="w-full bg-transparent text-center text-white text-xs font-bold focus:outline-none"
+                          />
+                          <span className="text-4xs text-amber-400 block">{modStr}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Footer Buttons */}
+                <div className="flex items-center justify-between pt-3 border-t border-white/10">
+                  {editingCharacter.id !== "dm" && (
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteCharacter(editingCharacter.id)}
+                      className="px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-950/40 border border-red-500/30 rounded-lg text-xs font-mono flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Remove Hero</span>
+                    </button>
+                  )}
+
+                  <div className="flex gap-2 ml-auto">
+                    <button
+                      type="button"
+                      onClick={() => setEditingCharacter(null)}
+                      className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-mono cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="px-5 py-2 bg-amber-500 hover:bg-amber-400 text-black font-mono font-bold text-xs uppercase rounded-lg transition-colors cursor-pointer shadow-lg"
+                    >
+                      Save Hero
+                    </button>
+                  </div>
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Standalone Desktop Executable & Campaign Save Manager Modal */}
+      <StandaloneModal
+        isOpen={isStandaloneModalOpen}
+        onClose={() => setIsStandaloneModalOpen(false)}
+        campaignState={state}
+        onImportCampaign={(newState) => setState(newState)}
+      />
+
+    </div>
+  );
+}

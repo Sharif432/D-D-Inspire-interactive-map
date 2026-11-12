@@ -1,0 +1,6 @@
+{
+  "name": "D&D Campaign Companion",
+  "description": "An interactive D&D campaign assistant featuring a dynamic map node-tracker, customized character speech generators, interactive stats-based dice roller, and a live persistent journal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
