@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { CampaignLocation, LocationType, CampaignState, SiteBattleMap, CityBuildingPin } from "../types";
+import { CampaignLocation, LocationType, CampaignState, SiteBattleMap, CityBuildingPin, FogOfWarState, BuildingType, MapToken } from "../types";
 import { 
   Map, 
   MapPin, 
@@ -32,22 +32,44 @@ import {
   ChevronDown,
   ChevronUp,
   Route,
-  Tag
+  Tag,
+  Cloud,
+  CloudOff,
+  Eraser,
+  Undo2
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import SiteBattleMapModal from "./SiteBattleMapModal";
+import FogOfWarOverlay from "./FogOfWarOverlay";
+import { isPointVisibleToPlayers } from "../utils/fogOfWar";
+import {
+  BUILDING_TYPE_OPTIONS,
+  LOCATION_TYPE_OPTIONS,
+  extractCampaignImages,
+  getBuildingIconByType,
+  getLocationIconByType,
+  processUploadedImage
+} from "../utils/imageUtils";
 
 interface MapInterfaceProps {
   campaignState: CampaignState;
   onMoveParty: (locationId: string) => Promise<void>;
   onToggleDiscovered: (locationId: string) => Promise<void>;
   onCreateLocation: (location: { name: string; description: string; type: LocationType; x: number; y: number; isHidden: boolean }) => Promise<void>;
-  onSaveBattleMaps?: (locationId: string, interiorMaps: SiteBattleMap[], activeInteriorMapId: string) => Promise<void>;
+  onSaveBattleMaps?: (locationId: string, interiorMaps: SiteBattleMap[], activeInteriorMapId: string, buildingId?: string) => Promise<void>;
   onUpdateRegionImage?: (regionId: string, imageUrl: string) => Promise<void>;
   onUpdateLocation?: (location: Partial<CampaignLocation> & { id: string }) => Promise<void>;
   onDeleteLocation?: (locationId: string) => Promise<void>;
   onToggleBossSlain?: (locationId: string) => Promise<void>;
   onToggleHidden?: (locationId: string) => Promise<void>;
+  onUpdateFog?: (payload: {
+    targetType: "region" | "city" | "building" | "battlemap";
+    regionId?: string;
+    locationId?: string;
+    buildingId?: string;
+    mapId?: string;
+    fogOfWar: FogOfWarState;
+  }) => Promise<void>;
 }
 
 export const REGION_PRESETS = [
@@ -93,14 +115,21 @@ export default function MapInterface({
   onUpdateLocation,
   onDeleteLocation,
   onToggleBossSlain,
-  onToggleHidden
+  onToggleHidden,
+  onUpdateFog
 }: MapInterfaceProps) {
   const [activeRegionId, setActiveRegionId] = useState<string>("sword_coast");
   const [selectedLocation, setSelectedLocation] = useState<CampaignLocation | null>(null);
   const [insideBattleMapLocation, setInsideBattleMapLocation] = useState<CampaignLocation | null>(null);
+  const [insideBattleMapBuildingId, setInsideBattleMapBuildingId] = useState<string | null>(null);
   const [isRegionImageModalOpen, setIsRegionImageModalOpen] = useState(false);
   const [regionUrlInput, setRegionUrlInput] = useState("");
   const regionFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Fog of War DM Controls
+  const [fogBrushMode, setFogBrushMode] = useState<"off" | "reveal" | "hide">("off");
+  const [fogBrushRadius, setFogBrushRadius] = useState<number>(12);
+  const [isFogToolbarOpen, setIsFogToolbarOpen] = useState<boolean>(false);
 
   // DM Mode vs Player View
   const [isDmMode, setIsDmMode] = useState<boolean>(true);
@@ -114,14 +143,29 @@ export default function MapInterface({
   const [editType, setEditType] = useState<LocationType>("cave");
   const [editDanger, setEditDanger] = useState<number>(2);
   const [editImageUrl, setEditImageUrl] = useState("");
+  const [editLocX, setEditLocX] = useState<number>(50);
+  const [editLocY, setEditLocY] = useState<number>(50);
   const [editCondition, setEditCondition] = useState<'normal' | 'cleared' | 'besieged' | 'cursed' | 'hazardous'>('normal');
   const [editBossSlain, setEditBossSlain] = useState(false);
   const [editIsHidden, setEditIsHidden] = useState(false);
   const [isDeletingConfirm, setIsDeletingConfirm] = useState(false);
   const nodeFileInputRef = useRef<HTMLInputElement>(null);
 
-  // Reposition / Dragging Node State
+  // Reposition / Dragging Node & Building Pin State
   const [repositioningLocId, setRepositioningLocId] = useState<string | null>(null);
+  const [repositioningBuildingId, setRepositioningBuildingId] = useState<string | null>(null);
+
+  // Edit City Building / POI Modal State
+  const [editingBuilding, setEditingBuilding] = useState<CityBuildingPin | null>(null);
+  const [editBldName, setEditBldName] = useState("");
+  const [editBldDesc, setEditBldDesc] = useState("");
+  const [editBldType, setEditBldType] = useState<BuildingType>("tavern");
+  const [editBldImageUrl, setEditBldImageUrl] = useState("");
+  const [editBldX, setEditBldX] = useState<number>(50);
+  const [editBldY, setEditBldY] = useState<number>(50);
+  const [editBldIsHidden, setEditBldIsHidden] = useState(false);
+  const [editBldBossSlain, setEditBldBossSlain] = useState(false);
+  const editBldFileInputRef = useRef<HTMLInputElement>(null);
 
   // Create Location states
   const [isAddingLocation, setIsAddingLocation] = useState(false);
@@ -139,8 +183,7 @@ export default function MapInterface({
   // Mobile drawer state
   const [mobileTab, setMobileTab] = useState<"map" | "roster" | "details">("map");
 
-  // Map Fit Mode (Contain = uncropped 100% visible, Cover = fill canvas)
-  const [mapFitMode, setMapFitMode] = useState<"contain" | "cover">("contain");
+  // Map Aspect Ratio for 100% uncropped display
   const [mapAspect, setMapAspect] = useState<number>(16 / 9);
 
   // Multi-Level Map Hierarchy Navigation: 'realm' (World) -> 'city' (Settlement) -> 'tavern' (Building)
@@ -158,9 +201,10 @@ export default function MapInterface({
   const [tavernImageUrlInput, setTavernImageUrlInput] = useState("");
   const tavernFileInputRef = useRef<HTMLInputElement>(null);
 
-  // Line & Town Name Visibility Toggles
+  // Line, Town Name & Pin Size Toggles (default 'sm' so pins don't cover too much of the map)
   const [showLines, setShowLines] = useState<boolean>(true);
   const [showTownNames, setShowTownNames] = useState<boolean>(true);
+  const [pinSize, setPinSize] = useState<"xs" | "sm" | "md">("sm");
 
   // Connection routes editor state (for Edit Location Modal)
   const [editConnectedTo, setEditConnectedTo] = useState<string[]>([]);
@@ -174,7 +218,7 @@ export default function MapInterface({
   const [tempBuildingCoords, setTempBuildingCoords] = useState<{ x: number; y: number } | null>(null);
   const [newBuildingName, setNewBuildingName] = useState("");
   const [newBuildingDesc, setNewBuildingDesc] = useState("");
-  const [newBuildingType, setNewBuildingType] = useState<CityBuildingPin["type"]>("tavern");
+  const [newBuildingType, setNewBuildingType] = useState<BuildingType>("tavern");
   const [newBuildingImageUrl, setNewBuildingImageUrl] = useState("");
   const buildingFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -197,30 +241,98 @@ export default function MapInterface({
     return activeRegionId === "underdark" ? isUnderdark : !isUnderdark;
   });
 
-  // Filter based on Player View vs DM Mode:
-  // In Player View: hide any location where isHidden is true!
-  const visibleLocations = regionLocations.filter((loc) => {
-    if (isDmMode) return true;
-    return !loc.isHidden;
-  });
-
-  // Auto-select party location on mount / region change
-  useEffect(() => {
-    if (partyLocation) {
-      const isPartyInUnderdark = ["underdark_passage", "gracklstagh", "sloopidoop", "hidden_shrine"].includes(partyLocation.id);
-      if (isPartyInUnderdark && activeRegionId !== "underdark") {
-        setActiveRegionId("underdark");
-      } else if (!isPartyInUnderdark && activeRegionId !== "sword_coast") {
-        setActiveRegionId("sword_coast");
-      }
-      setSelectedLocation(partyLocation);
-    }
-  }, [campaignState.partyLocationId]);
-
   // Active Nested City Location
   const currentCityLocation = campaignState.locations.find((l) => l.id === currentCityLocationId) || null;
   // Active Nested Building (Tavern / Inn / Hall)
   const currentBuilding = currentCityLocation?.cityBuildings?.find((b) => b.id === currentBuildingId) || null;
+
+  // Current map level's Fog of War state
+  const activeFogOfWar: FogOfWarState | undefined =
+    mapNavLevel === "realm"
+      ? activeRegion?.fogOfWar
+      : mapNavLevel === "city"
+      ? currentCityLocation?.cityFogOfWar
+      : currentBuilding?.fogOfWar;
+
+  // Save Fog of War changes for the current map level
+  const handleUpdateActiveFog = async (nextFog: FogOfWarState) => {
+    if (!onUpdateFog) return;
+    if (mapNavLevel === "realm" && activeRegion) {
+      await onUpdateFog({
+        targetType: "region",
+        regionId: activeRegion.id,
+        fogOfWar: nextFog
+      });
+    } else if (mapNavLevel === "city" && currentCityLocation) {
+      await onUpdateFog({
+        targetType: "city",
+        locationId: currentCityLocation.id,
+        fogOfWar: nextFog
+      });
+    } else if (mapNavLevel === "tavern" && currentCityLocation && currentBuilding) {
+      await onUpdateFog({
+        targetType: "building",
+        locationId: currentCityLocation.id,
+        buildingId: currentBuilding.id,
+        fogOfWar: nextFog
+      });
+    }
+  };
+
+  // Toggle Fog of War ON/OFF button handler
+  const handleToggleFogToolbarOrEnable = async () => {
+    if (!activeFogOfWar?.enabled) {
+      await handleUpdateActiveFog({
+        enabled: true,
+        strokes: activeFogOfWar?.strokes || []
+      });
+      setIsFogToolbarOpen(true);
+      setFogBrushMode("reveal");
+      setIsAddingLocation(false);
+      setIsAddingBuilding(false);
+      setRepositioningLocId(null);
+    } else {
+      setIsFogToolbarOpen((prev) => {
+        const nextOpen = !prev;
+        if (!nextOpen) setFogBrushMode("off");
+        return nextOpen;
+      });
+    }
+  };
+
+  // Filter based on Player View vs DM Mode (respects both isHidden AND Fog of War!)
+  const visibleLocations = regionLocations.filter((loc) => {
+    if (isDmMode) return true;
+    if (loc.isHidden) return false;
+    if (activeFogOfWar?.enabled && mapNavLevel === "realm") {
+      return isPointVisibleToPlayers(activeFogOfWar, loc.x, loc.y, mapAspect);
+    }
+    return true;
+  });
+
+  // City buildings visible to current viewer
+  const visibleCityBuildings = (currentCityLocation?.cityBuildings || []).filter((bld) => {
+    if (isDmMode) return true;
+    if (bld.isHidden) return false;
+    if (currentCityLocation?.cityFogOfWar?.enabled) {
+      return isPointVisibleToPlayers(currentCityLocation.cityFogOfWar, bld.x, bld.y, mapAspect);
+    }
+    return true;
+  });
+
+  const canViewSelectedLocation =
+    !!selectedLocation &&
+    (isDmMode ||
+      (!selectedLocation.isHidden &&
+        (!activeRegion?.fogOfWar?.enabled ||
+          isPointVisibleToPlayers(activeRegion.fogOfWar, selectedLocation.x, selectedLocation.y, mapAspect))));
+
+  const canViewSelectedBuilding =
+    !!selectedBuilding &&
+    (isDmMode ||
+      (!selectedBuilding.isHidden &&
+        (!currentCityLocation?.cityFogOfWar?.enabled ||
+          isPointVisibleToPlayers(currentCityLocation.cityFogOfWar, selectedBuilding.x, selectedBuilding.y, mapAspect))));
 
   // Sync selected building
   useEffect(() => {
@@ -229,18 +341,11 @@ export default function MapInterface({
     }
   }, [currentBuildingId]);
 
+  const savedCampaignImages = extractCampaignImages(campaignState);
+
   // Helper for Building Icons
-  const getBuildingIcon = (type: CityBuildingPin["type"]) => {
-    switch (type) {
-      case "tavern": return "🍺";
-      case "shop": return "🛒";
-      case "guild": return "🛡️";
-      case "temple": return "⛩️";
-      case "residence": return "🏡";
-      case "civic": return "🏛️";
-      case "ruin": return "🏚️";
-      default: return "📍";
-    }
+  const getBuildingIcon = (type: BuildingType | string) => {
+    return getBuildingIconByType(type);
   };
 
   // Enter City / Settlement Map
@@ -249,18 +354,82 @@ export default function MapInterface({
     setMapNavLevel("city");
     setCurrentBuildingId(null);
     setSelectedBuilding(null);
+    setRepositioningBuildingId(null);
+    setRepositioningLocId(null);
     setSelectedLocation(location);
     setZoomScale(1.0);
     setPanOffset({ x: 0, y: 0 });
   };
 
-  // Enter Tavern / Building Interior Map
-  const handleEnterTavernMap = (building: CityBuildingPin) => {
+  // Helper: build auto-deployed party tokens near entrance for instant tactical readiness
+  const buildStarterPartyTokens = (cols: number, rows: number): MapToken[] => {
+    const tokens: MapToken[] = [];
+    let sx = 1;
+    let sy = Math.max(0, rows - 2);
+    campaignState.characters.forEach((char) => {
+      if (char.id === "dm" && campaignState.characters.length > 1) return;
+      tokens.push({
+        id: "token_" + char.id + "_" + Date.now() + "_" + tokens.length,
+        name: char.name,
+        characterId: char.id,
+        avatarUrl: char.avatarUrl,
+        type: "player",
+        x: Math.min(cols - 1, sx),
+        y: sy,
+        hp: char.hp ? { current: char.hp.current, max: char.hp.max } : undefined
+      });
+      sx++;
+      if (sx > Math.min(cols - 1, 4)) {
+        sx = 1;
+        sy = Math.max(0, sy - 1);
+      }
+    });
+    return tokens;
+  };
+
+  // Enter Tavern / Shop / Building -> Immediately open Tactical Combat Grid with Party Tokens ready!
+  const handleEnterTavernMap = async (building: CityBuildingPin) => {
     setCurrentBuildingId(building.id);
     setSelectedBuilding(building);
-    setMapNavLevel("tavern");
-    setZoomScale(1.0);
-    setPanOffset({ x: 0, y: 0 });
+    if (!currentCityLocation) return;
+
+    const baseMaps: SiteBattleMap[] =
+      building.interiorMaps && building.interiorMaps.length > 0
+        ? building.interiorMaps
+        : [
+            {
+              id: "map_" + building.id,
+              locationId: currentCityLocation.id,
+              name: building.name + " - Tactical Floor",
+              description: building.description,
+              imageUrl:
+                building.imageUrl ||
+                "https://images.unsplash.com/photo-1543007630-9710e4a00a20?auto=format&fit=crop&q=80&w=1200",
+              gridCols: 14,
+              gridRows: 10,
+              showGrid: true,
+              tokens: []
+            }
+          ];
+
+    // Ensure entering a tavern/shop immediately feels like stepping onto a live tactical grid with tokens
+    const firstMap = baseMaps[0];
+    let readyMaps = baseMaps;
+    if (firstMap && (!firstMap.tokens || firstMap.tokens.length === 0)) {
+      const starterTokens = buildStarterPartyTokens(firstMap.gridCols || 14, firstMap.gridRows || 10);
+      readyMaps = baseMaps.map((m, idx) => (idx === 0 ? { ...m, tokens: starterTokens } : m));
+      if (onSaveBattleMaps) {
+        await onSaveBattleMaps(currentCityLocation.id, readyMaps, firstMap.id, building.id);
+      }
+    }
+
+    setInsideBattleMapBuildingId(building.id);
+    setInsideBattleMapLocation({
+      ...currentCityLocation,
+      name: `${currentCityLocation.name} - ${building.name}`,
+      interiorMaps: readyMaps,
+      activeInteriorMapId: readyMaps[0]?.id
+    });
   };
 
   // Return to Realm Map
@@ -269,6 +438,7 @@ export default function MapInterface({
     setCurrentCityLocationId(null);
     setCurrentBuildingId(null);
     setSelectedBuilding(null);
+    setRepositioningBuildingId(null);
     setZoomScale(1.0);
     setPanOffset({ x: 0, y: 0 });
   };
@@ -278,6 +448,7 @@ export default function MapInterface({
     setMapNavLevel("city");
     setCurrentBuildingId(null);
     setSelectedBuilding(null);
+    setRepositioningBuildingId(null);
     setZoomScale(1.0);
     setPanOffset({ x: 0, y: 0 });
   };
@@ -285,28 +456,11 @@ export default function MapInterface({
   // Launch Battle Map directly from Tavern or Location
   const handleOpenTacticalBattleGrid = () => {
     if (mapNavLevel === "tavern" && currentBuilding && currentCityLocation) {
-      const interiorMaps = currentBuilding.interiorMaps && currentBuilding.interiorMaps.length > 0 
-        ? currentBuilding.interiorMaps 
-        : [
-            {
-              id: "map_" + currentBuilding.id,
-              locationId: currentCityLocation.id,
-              name: currentBuilding.name + " - Tactical Floor",
-              description: currentBuilding.description,
-              imageUrl: currentBuilding.imageUrl || "https://images.unsplash.com/photo-1543007630-9710e4a00a20?auto=format&fit=crop&q=80&w=1200",
-              gridCols: 14,
-              gridRows: 10,
-              showGrid: true,
-              tokens: []
-            }
-          ];
-      setInsideBattleMapLocation({
-        ...currentCityLocation,
-        name: `${currentCityLocation.name} - ${currentBuilding.name}`,
-        interiorMaps,
-        activeInteriorMapId: interiorMaps[0]?.id
-      });
+      handleEnterTavernMap(currentBuilding);
+    } else if (mapNavLevel === "city" && selectedBuilding && currentCityLocation) {
+      handleEnterTavernMap(selectedBuilding);
     } else if (selectedLocation) {
+      setInsideBattleMapBuildingId(null);
       setInsideBattleMapLocation(selectedLocation);
     }
   };
@@ -323,17 +477,15 @@ export default function MapInterface({
   };
 
   // Handle City File Upload
-  const handleCityFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleCityFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      const dataUrl = event.target?.result as string;
-      if (dataUrl) {
-        await handleApplyCityImage(dataUrl);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await processUploadedImage(file);
+      if (dataUrl) await handleApplyCityImage(dataUrl);
+    } catch (err) {
+      console.error("City image upload error:", err);
+    }
   };
 
   // Handle Tavern Map Background Image Change
@@ -351,31 +503,78 @@ export default function MapInterface({
   };
 
   // Handle Tavern File Upload
-  const handleTavernFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleTavernFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      const dataUrl = event.target?.result as string;
-      if (dataUrl) {
-        await handleApplyTavernImage(dataUrl);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await processUploadedImage(file);
+      if (dataUrl) await handleApplyTavernImage(dataUrl);
+    } catch (err) {
+      console.error("Tavern image upload error:", err);
+    }
   };
 
   // Upload custom picture for city POI building / tavern
-  const handleBuildingImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleBuildingImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
-      if (dataUrl) {
-        setNewBuildingImageUrl(dataUrl);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await processUploadedImage(file);
+      if (dataUrl) setNewBuildingImageUrl(dataUrl);
+    } catch (err) {
+      console.error("Building image upload error:", err);
+    }
+  };
+
+  // Open Edit City Building Modal
+  const openEditBuildingModal = (bld: CityBuildingPin) => {
+    setEditingBuilding(bld);
+    setEditBldName(bld.name);
+    setEditBldDesc(bld.description || "");
+    setEditBldType(bld.type);
+    setEditBldImageUrl(bld.imageUrl || "");
+    setEditBldX(bld.x);
+    setEditBldY(bld.y);
+    setEditBldIsHidden(!!bld.isHidden);
+    setEditBldBossSlain(!!bld.bossSlain);
+  };
+
+  const handleEditBuildingImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const dataUrl = await processUploadedImage(file);
+      if (dataUrl) setEditBldImageUrl(dataUrl);
+    } catch (err) {
+      console.error("Edit building image upload error:", err);
+    }
+  };
+
+  const handleSaveBuildingEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentCityLocation || !editingBuilding || !onUpdateLocation) return;
+    const safeX = Math.max(0.5, Math.min(99.5, Number(editBldX) || editingBuilding.x));
+    const safeY = Math.max(0.5, Math.min(99.5, Number(editBldY) || editingBuilding.y));
+    const updatedBuildings = (currentCityLocation.cityBuildings || []).map((b) =>
+      b.id === editingBuilding.id
+        ? {
+            ...b,
+            name: editBldName.trim() || b.name,
+            description: editBldDesc.trim(),
+            type: editBldType,
+            imageUrl: editBldImageUrl.trim() || b.imageUrl,
+            x: safeX,
+            y: safeY,
+            isHidden: editBldIsHidden,
+            bossSlain: editBldBossSlain
+          }
+        : b
+    );
+    await onUpdateLocation({
+      id: currentCityLocation.id,
+      cityBuildings: updatedBuildings
+    });
+    setEditingBuilding(null);
   };
 
   // Add new Building Pin on City Map
@@ -401,19 +600,19 @@ export default function MapInterface({
       x: tempBuildingCoords.x,
       y: tempBuildingCoords.y,
       imageUrl: finalImage,
-      interiorMaps: ["tavern", "inn", "guild", "temple", "ruin"].includes(newBuildingType) ? [
+      interiorMaps: [
         {
           id: "map_taproom_" + Date.now(),
           locationId: currentCityLocation.id,
           name: newBuildingName.trim() + " - Interior Floor",
-          description: "Tactical floor plan with bar, tables, private rooms, and fireplace.",
+          description: "Tactical floor plan ready for tokens and encounters.",
           imageUrl: finalImage,
           gridCols: 14,
           gridRows: 10,
           showGrid: true,
           tokens: []
         }
-      ] : undefined
+      ]
     };
     const updatedBuildings = [...(currentCityLocation.cityBuildings || []), newBuilding];
     await onUpdateLocation({
@@ -455,6 +654,11 @@ export default function MapInterface({
       const updated = campaignState.locations.find(l => l.id === selectedLocation.id);
       if (updated) setSelectedLocation(updated);
     }
+    if (selectedBuilding && currentCityLocationId) {
+      const city = campaignState.locations.find(l => l.id === currentCityLocationId);
+      const updatedBld = city?.cityBuildings?.find(b => b.id === selectedBuilding.id);
+      if (updatedBld) setSelectedBuilding(updatedBld);
+    }
   }, [campaignState.locations]);
 
   // ==========================================
@@ -467,7 +671,15 @@ export default function MapInterface({
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
-    if (isAddingLocation || repositioningLocId) return;
+    if (
+      isAddingLocation ||
+      isAddingBuilding ||
+      repositioningLocId ||
+      repositioningBuildingId ||
+      (isDmMode && activeFogOfWar?.enabled && fogBrushMode !== "off")
+    ) {
+      return;
+    }
     if (e.button !== 0) return; // Only left click
     setIsDraggingMap(true);
     dragStartRef.current = { x: e.clientX - panOffset.x, y: e.clientY - panOffset.y };
@@ -487,7 +699,15 @@ export default function MapInterface({
 
   // Touch handlers for iPhone / mobile
   const handleTouchStart = (e: React.TouchEvent) => {
-    if (isAddingLocation || repositioningLocId) return;
+    if (
+      isAddingLocation ||
+      isAddingBuilding ||
+      repositioningLocId ||
+      repositioningBuildingId ||
+      (isDmMode && activeFogOfWar?.enabled && fogBrushMode !== "off")
+    ) {
+      return;
+    }
     if (e.touches.length === 1) {
       setIsDraggingMap(true);
       dragStartRef.current = {
@@ -541,8 +761,9 @@ export default function MapInterface({
     setPanOffset({ x: targetX, y: targetY });
   };
 
-  // Handle Map Click (Adding Location, POI Building Pin, or Repositioning Pin)
+  // Handle Map Click (Adding Location, POI Building Pin, or Repositioning Pin across ALL map levels)
   const handleMapCanvasClick = async (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isDmMode && activeFogOfWar?.enabled && fogBrushMode !== "off") return;
     // Calculate against the exact inner transformed aspect-ratio canvas where map image & pins reside
     const targetCanvas = isBigMapOpen ? innerBigCanvasRef.current : innerCanvasRef.current;
     if (!targetCanvas) return;
@@ -556,10 +777,24 @@ export default function MapInterface({
       return;
     }
 
-    const xPct = Math.max(1, Math.min(99, parseFloat(((clickX / rect.width) * 100).toFixed(1))));
-    const yPct = Math.max(1, Math.min(99, parseFloat(((clickY / rect.height) * 100).toFixed(1))));
+    // 2-decimal precision for ultra-accurate placement on large/detailed maps
+    const xPct = Math.max(0.5, Math.min(99.5, parseFloat(((clickX / rect.width) * 100).toFixed(2))));
+    const yPct = Math.max(0.5, Math.min(99.5, parseFloat(((clickY / rect.height) * 100).toFixed(2))));
 
-    // If repositioning an existing pin
+    // If repositioning an existing City Building POI pin
+    if (repositioningBuildingId && mapNavLevel === "city" && currentCityLocation && onUpdateLocation) {
+      const updatedBuildings = (currentCityLocation.cityBuildings || []).map((b) =>
+        b.id === repositioningBuildingId ? { ...b, x: xPct, y: yPct } : b
+      );
+      await onUpdateLocation({
+        id: currentCityLocation.id,
+        cityBuildings: updatedBuildings
+      });
+      setRepositioningBuildingId(null);
+      return;
+    }
+
+    // If repositioning an existing Realm Location pin
     if (repositioningLocId) {
       if (onUpdateLocation) {
         await onUpdateLocation({ id: repositioningLocId, x: xPct, y: yPct });
@@ -588,6 +823,8 @@ export default function MapInterface({
     setEditType(loc.type);
     setEditDanger(loc.dangerLevel || 2);
     setEditImageUrl(loc.imageUrl || "");
+    setEditLocX(loc.x);
+    setEditLocY(loc.y);
     setEditCondition(loc.condition || "normal");
     setEditBossSlain(!!loc.bossSlain);
     setEditIsHidden(!!loc.isHidden);
@@ -607,6 +844,8 @@ export default function MapInterface({
       type: editType,
       dangerLevel: editDanger,
       imageUrl: editImageUrl,
+      x: Math.max(0.5, Math.min(99.5, Number(editLocX) || editingLocation.x)),
+      y: Math.max(0.5, Math.min(99.5, Number(editLocY) || editingLocation.y)),
       condition: editCondition,
       bossSlain: editBossSlain,
       isHidden: editIsHidden,
@@ -628,15 +867,15 @@ export default function MapInterface({
   };
 
   // Node image upload handler
-  const handleNodeImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleNodeImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
+    try {
+      const dataUrl = await processUploadedImage(file);
       if (dataUrl) setEditImageUrl(dataUrl);
-    };
-    reader.readAsDataURL(file);
+    } catch (err) {
+      console.error("Node image upload error:", err);
+    }
   };
 
   // Create Location Submit
@@ -660,18 +899,116 @@ export default function MapInterface({
     setIsAddingLocation(false);
   };
 
-  const getLocationIcon = (type: LocationType) => {
-    switch (type) {
-      case "town": return "🏰";
-      case "dungeon": return "💀";
-      case "forest": return "🌲";
-      case "ruins": return "🏚️";
-      case "castle": return "🛡️";
-      case "cave": return "🕳️";
-      case "shrine": return "🔮";
-      default: return "📍";
-    }
+  const getLocationIcon = (type: LocationType | string) => {
+    return getLocationIconByType(type);
   };
+
+  const renderSavedImagesPicker = (onSelect: (url: string) => void, activeUrl?: string) => {
+    if (savedCampaignImages.length === 0) return null;
+    return (
+      <div className="space-y-1.5 pt-2 border-t border-white/10">
+        <div className="flex items-center justify-between">
+          <label className="text-2xs uppercase font-mono text-emerald-400 font-bold flex items-center gap-1">
+            <ImageIcon className="w-3 h-3" />
+            <span>Saved Campaign Pictures ({savedCampaignImages.length})</span>
+          </label>
+          <span className="text-4xs font-mono text-slate-500">Click to reuse</span>
+        </div>
+        <div className="grid grid-cols-4 sm:grid-cols-6 gap-1.5 max-h-28 overflow-y-auto pr-1">
+          {savedCampaignImages.map((img, idx) => {
+            const isActive = activeUrl === img.url;
+            return (
+              <button
+                key={`saved-img-${idx}`}
+                type="button"
+                onClick={() => onSelect(img.url)}
+                title={img.label}
+                className={`group/thumb relative h-12 rounded-lg overflow-hidden border transition-all cursor-pointer ${
+                  isActive
+                    ? "border-amber-400 ring-2 ring-amber-400/50"
+                    : "border-white/15 hover:border-amber-400"
+                }`}
+              >
+                <img src={img.url} alt={img.label} className="w-full h-full object-cover" />
+                <div className="absolute inset-x-0 bottom-0 bg-black/75 px-1 py-0.5 text-[8px] font-mono text-slate-200 truncate opacity-0 group-hover/thumb:opacity-100 transition-opacity">
+                  {img.label}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  const pinSizeCfg = {
+    xs: {
+      realmBtn: "p-0.5",
+      realmImg: "w-3.5 h-3.5",
+      realmEmoji: "text-[10px]",
+      realmSlay: "w-5 h-5",
+      realmLabelTop: "top-6",
+      realmLabelText: "text-[9px] px-1 py-0",
+      bldBtn: "p-0.5",
+      bldEmoji: "text-[11px]",
+      bldSlay: "w-5 h-5",
+      bldLabelTop: "top-6",
+      bldLabelText: "text-[9px] px-1 py-0",
+      bigRealmBtn: "p-1",
+      bigRealmImg: "w-4 h-4",
+      bigRealmEmoji: "text-xs",
+      bigRealmSlay: "w-6 h-6",
+      bigRealmLabelTop: "top-7",
+      bigBldBtn: "p-1",
+      bigBldEmoji: "text-xs",
+      bigBldSlay: "w-6 h-6",
+      bigBldLabelTop: "top-7"
+    },
+    sm: {
+      realmBtn: "p-1",
+      realmImg: "w-4.5 h-4.5",
+      realmEmoji: "text-xs",
+      realmSlay: "w-6 h-6",
+      realmLabelTop: "top-7",
+      realmLabelText: "text-3xs px-1.5 py-0.5",
+      bldBtn: "p-1.5",
+      bldEmoji: "text-xs",
+      bldSlay: "w-7 h-7",
+      bldLabelTop: "top-8",
+      bldLabelText: "text-3xs px-1.5 py-0.5",
+      bigRealmBtn: "p-1.5",
+      bigRealmImg: "w-5 h-5",
+      bigRealmEmoji: "text-sm",
+      bigRealmSlay: "w-8 h-8",
+      bigRealmLabelTop: "top-8",
+      bigBldBtn: "p-1.5",
+      bigBldEmoji: "text-sm",
+      bigBldSlay: "w-8 h-8",
+      bigBldLabelTop: "top-8"
+    },
+    md: {
+      realmBtn: "p-2",
+      realmImg: "w-6 h-6",
+      realmEmoji: "text-sm",
+      realmSlay: "w-9 h-9",
+      realmLabelTop: "top-9",
+      realmLabelText: "text-3xs px-1.5 py-0.5",
+      bldBtn: "p-2.5",
+      bldEmoji: "text-base",
+      bldSlay: "w-9 h-9",
+      bldLabelTop: "top-11",
+      bldLabelText: "text-3xs px-2 py-0.5",
+      bigRealmBtn: "p-2.5",
+      bigRealmImg: "w-8 h-8",
+      bigRealmEmoji: "text-lg",
+      bigRealmSlay: "w-11 h-11",
+      bigRealmLabelTop: "top-11",
+      bigBldBtn: "p-3",
+      bigBldEmoji: "text-xl",
+      bigBldSlay: "w-11 h-11",
+      bigBldLabelTop: "top-12"
+    }
+  }[pinSize];
 
   const getConditionBadge = (condition?: string) => {
     switch (condition) {
@@ -705,17 +1042,15 @@ export default function MapInterface({
     setIsRegionImageModalOpen(false);
   };
 
-  const handleRegionFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleRegionFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      const dataUrl = event.target?.result as string;
-      if (dataUrl) {
-        await handleApplyRegionImage(dataUrl);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await processUploadedImage(file);
+      if (dataUrl) await handleApplyRegionImage(dataUrl);
+    } catch (err) {
+      console.error("Region image upload error:", err);
+    }
   };
 
   return (
@@ -837,19 +1172,40 @@ export default function MapInterface({
             <span className="hidden sm:inline">{showTownNames ? "🏷️ Names: ON" : "🏷️ Names: OFF"}</span>
           </button>
 
-          {/* Map Fit Mode Toggle (Uncropped 100% visible vs Fill) */}
-          <button
-            onClick={() => setMapFitMode(m => m === "contain" ? "cover" : "contain")}
-            className={`p-1.5 sm:px-2.5 sm:py-1 rounded-lg text-2xs font-mono font-bold flex items-center gap-1 transition-all border cursor-pointer ${
-              mapFitMode === "contain"
-                ? "bg-amber-500/20 text-amber-300 border-amber-500/50"
-                : "bg-[#1a1d2c] hover:bg-[#23273a] text-slate-300 border-white/10 hover:text-white"
-            }`}
-            title="Ensure 100% of map picture is visible without edge cropping"
+          {/* Pin Size Control */}
+          <div
+            className="flex items-center bg-[#1a1d2c] border border-white/10 rounded-lg p-0.5 text-3xs font-mono"
+            title="Adjust map pin icon size"
           >
-            <ImageIcon className="w-3.5 h-3.5 text-amber-400" />
-            <span className="hidden sm:inline">{mapFitMode === "contain" ? "🖼️ Uncropped (100%)" : "↔️ Fill Canvas"}</span>
-          </button>
+            <span className="px-1.5 text-slate-400 hidden sm:inline">Pin:</span>
+            {(["xs", "sm", "md"] as const).map((sz) => (
+              <button
+                key={sz}
+                onClick={() => setPinSize(sz)}
+                className={`px-1.5 py-0.5 rounded uppercase font-bold cursor-pointer transition-colors ${
+                  pinSize === sz ? "bg-amber-500 text-black" : "text-slate-400 hover:text-white"
+                }`}
+              >
+                {sz === "xs" ? "XS" : sz === "sm" ? "S" : "M"}
+              </button>
+            ))}
+          </div>
+
+          {/* Fog of War DM Toggle */}
+          {isDmMode && (
+            <button
+              onClick={handleToggleFogToolbarOrEnable}
+              className={`p-1.5 sm:px-2.5 sm:py-1 rounded-lg text-2xs font-mono font-bold flex items-center gap-1 transition-all border cursor-pointer ${
+                activeFogOfWar?.enabled
+                  ? "bg-purple-600/30 text-purple-200 border-purple-400/60 shadow"
+                  : "bg-[#1a1d2c] hover:bg-[#23273a] text-slate-300 border-white/10 hover:text-white"
+              }`}
+              title="Manage Fog of War for Players on this map"
+            >
+              <Cloud className="w-3.5 h-3.5 text-purple-400" />
+              <span className="hidden sm:inline">{activeFogOfWar?.enabled ? "☁️ Fog: ON" : "☁️ Fog of War"}</span>
+            </button>
+          )}
 
           {/* Full Screen Big Map Projector */}
           <button
@@ -919,9 +1275,10 @@ export default function MapInterface({
                   className={`px-2.5 py-1 rounded-lg text-3xs font-mono font-bold transition-all cursor-pointer flex items-center space-x-1 ${
                     isAddingBuilding ? "bg-amber-500 text-black font-bold" : "bg-amber-500/15 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40"
                   }`}
+                  title="Plot a tavern, inn, shop, or landmark pin inside this city"
                 >
                   <Plus className="w-3 h-3" />
-                  <span>+ Add Building Pin</span>
+                  <span>{isAddingBuilding ? "Cancel POI" : "+ Add POI Pin (Tavern/Inn)"}</span>
                 </button>
               )}
               <button
@@ -1000,10 +1357,169 @@ export default function MapInterface({
           </div>
           <button
             onClick={() => setRepositioningLocId(null)}
-            className="bg-black text-white px-2 py-0.5 rounded text-2xs uppercase hover:bg-slate-900"
+            className="bg-black text-white px-2 py-0.5 rounded text-2xs uppercase hover:bg-slate-900 cursor-pointer"
           >
             Cancel
           </button>
+        </div>
+      )}
+
+      {/* REPOSITION CITY POI PIN ACTIVE BANNER */}
+      {repositioningBuildingId && (
+        <div className="bg-amber-500 text-black px-4 py-2 text-xs font-mono font-bold flex items-center justify-between shadow-lg animate-pulse">
+          <div className="flex items-center space-x-2">
+            <Move className="w-4 h-4" />
+            <span>Reposition POI Mode: Click anywhere on the city map to move this building/landmark pin!</span>
+          </div>
+          <button
+            onClick={() => setRepositioningBuildingId(null)}
+            className="bg-black text-white px-2 py-0.5 rounded text-2xs uppercase hover:bg-slate-900 cursor-pointer"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {/* ACTIVE CITY POI PLACEMENT NOTICE BAR */}
+      {mapNavLevel === "city" && isAddingBuilding && (
+        <div className="bg-amber-500 text-black px-4 py-2 text-xs font-mono font-bold flex items-center justify-between shadow-lg animate-pulse">
+          <div className="flex items-center space-x-2">
+            <Plus className="w-4 h-4" />
+            <span>Place of Interest Mode: Click anywhere on the map of {currentCityLocation?.name || "the city"} to place a Tavern, Harbour, Castle Wall, Shop, or Landmark!</span>
+          </div>
+          <button
+            onClick={() => {
+              setIsAddingBuilding(false);
+              setTempBuildingCoords(null);
+            }}
+            className="bg-black text-white px-2 py-0.5 rounded text-2xs uppercase hover:bg-slate-900 cursor-pointer"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {/* DM FOG OF WAR MANAGEMENT TOOLBAR */}
+      {isDmMode && isFogToolbarOpen && (
+        <div className="bg-[#151224] border-b border-purple-500/40 px-3 sm:px-4 py-2 flex flex-wrap items-center justify-between gap-2 text-xs font-mono shadow-lg">
+          <div className="flex items-center flex-wrap gap-1.5 sm:gap-2">
+            <span className="text-purple-300 font-bold flex items-center gap-1 mr-1">
+              <Cloud className="w-4 h-4 text-purple-400" />
+              <span>Fog of War:</span>
+            </span>
+
+            <button
+              onClick={() => setFogBrushMode(fogBrushMode === "reveal" ? "off" : "reveal")}
+              className={`px-2.5 py-1 rounded-lg border font-bold flex items-center gap-1 cursor-pointer transition-all ${
+                fogBrushMode === "reveal"
+                  ? "bg-amber-500 text-black border-amber-300 shadow"
+                  : "bg-white/5 hover:bg-white/10 text-slate-200 border-white/15"
+              }`}
+              title="Click and drag on the map to clear fog so players can see"
+            >
+              <Eraser className="w-3.5 h-3.5" />
+              <span>Clear Fog (Reveal)</span>
+            </button>
+
+            <button
+              onClick={() => setFogBrushMode(fogBrushMode === "hide" ? "off" : "hide")}
+              className={`px-2.5 py-1 rounded-lg border font-bold flex items-center gap-1 cursor-pointer transition-all ${
+                fogBrushMode === "hide"
+                  ? "bg-purple-500 text-white border-purple-300 shadow"
+                  : "bg-white/5 hover:bg-white/10 text-slate-200 border-white/15"
+              }`}
+              title="Click and drag on the map to cover area in fog again"
+            >
+              <Cloud className="w-3.5 h-3.5" />
+              <span>Add Fog (Cover)</span>
+            </button>
+
+            {/* Brush Sizes */}
+            <div className="flex items-center bg-black/40 border border-white/10 rounded-lg p-0.5 ml-1">
+              {[
+                { label: "S", r: 6 },
+                { label: "M", r: 12 },
+                { label: "L", r: 22 }
+              ].map((sz) => (
+                <button
+                  key={sz.label}
+                  onClick={() => setFogBrushRadius(sz.r)}
+                  className={`px-2 py-0.5 rounded text-2xs font-bold cursor-pointer ${
+                    fogBrushRadius === sz.r ? "bg-purple-500 text-white" : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  {sz.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex items-center flex-wrap gap-1.5">
+            <button
+              onClick={() => {
+                const strokes = activeFogOfWar?.strokes || [];
+                if (strokes.length > 0) {
+                  handleUpdateActiveFog({
+                    enabled: true,
+                    strokes: strokes.slice(0, -1)
+                  });
+                }
+              }}
+              disabled={!activeFogOfWar?.strokes?.length}
+              className="px-2 py-1 bg-white/5 hover:bg-white/10 disabled:opacity-40 text-slate-200 rounded-lg border border-white/10 flex items-center gap-1 cursor-pointer"
+              title="Undo last fog stroke"
+            >
+              <Undo2 className="w-3 h-3" />
+              <span>Undo</span>
+            </button>
+
+            <button
+              onClick={() => handleUpdateActiveFog({ enabled: true, strokes: [] })}
+              className="px-2 py-1 bg-purple-950/60 hover:bg-purple-900/70 text-purple-200 rounded-lg border border-purple-500/30 cursor-pointer"
+              title="Cover the entire map in Fog of War"
+            >
+              Cover All
+            </button>
+
+            <button
+              onClick={() =>
+                handleUpdateActiveFog({
+                  enabled: true,
+                  strokes: [{ x: 50, y: 50, r: 150, mode: "reveal" }]
+                })
+              }
+              className="px-2 py-1 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 rounded-lg border border-amber-500/30 cursor-pointer"
+              title="Reveal entire map"
+            >
+              Reveal All
+            </button>
+
+            <button
+              onClick={() => {
+                handleUpdateActiveFog({
+                  enabled: false,
+                  strokes: activeFogOfWar?.strokes || []
+                });
+                setFogBrushMode("off");
+                setIsFogToolbarOpen(false);
+              }}
+              className="px-2 py-1 bg-red-950/50 hover:bg-red-900/60 text-red-300 rounded-lg border border-red-500/30 flex items-center gap-1 cursor-pointer"
+              title="Disable Fog of War on this map"
+            >
+              <CloudOff className="w-3 h-3" />
+              <span>Turn Off Fog</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setFogBrushMode("off");
+                setIsFogToolbarOpen(false);
+              }}
+              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg cursor-pointer"
+            >
+              Done
+            </button>
+          </div>
         </div>
       )}
 
@@ -1096,9 +1612,7 @@ export default function MapInterface({
             onTouchEnd={handleTouchEnd}
             onClick={handleMapCanvasClick}
             className={`relative flex-1 w-full h-full select-none overflow-hidden ${
-              repositioningLocId 
-                ? "cursor-crosshair" 
-                : isAddingLocation 
+              repositioningLocId || repositioningBuildingId || isAddingLocation || isAddingBuilding
                 ? "cursor-crosshair" 
                 : isDraggingMap 
                 ? "cursor-grabbing" 
@@ -1112,16 +1626,15 @@ export default function MapInterface({
                 transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`,
                 transformOrigin: "center center",
                 transition: isDraggingMap ? "none" : "transform 0.08s ease-out",
-                width: mapFitMode === "contain" && mapAspect ? `${mapAspect >= 1 ? "100%" : "auto"}` : "100%",
-                height: mapFitMode === "contain" && mapAspect ? `${mapAspect < 1 ? "100%" : "auto"}` : "100%",
-                aspectRatio: mapFitMode === "contain" && mapAspect ? `${mapAspect}` : undefined,
+                width: mapAspect >= 1 ? "100%" : "auto",
+                height: mapAspect < 1 ? "100%" : "auto",
+                aspectRatio: `${mapAspect}`,
                 maxHeight: "100%",
-                maxWidth: "100%",
-                minHeight: mapFitMode === "contain" ? undefined : "520px"
+                maxWidth: "100%"
               }}
-              className={`relative ${mapFitMode === "contain" ? "m-auto" : "w-full h-full"}`}
+              className="relative m-auto"
             >
-              {/* Regional, City, or Tavern Map Background Image */}
+              {/* Regional, City, or Tavern Map Background Image (100% Uncropped Edge-to-Edge) */}
               <img
                 src={
                   mapNavLevel === "realm"
@@ -1136,9 +1649,7 @@ export default function MapInterface({
                     setMapAspect(e.currentTarget.naturalWidth / e.currentTarget.naturalHeight);
                   }
                 }}
-                className={`absolute inset-0 w-full h-full ${
-                  mapFitMode === "contain" ? "object-contain" : "object-cover"
-                } pointer-events-none filter brightness-90 contrast-105`}
+                className="absolute inset-0 w-full h-full object-fill pointer-events-none filter brightness-90 contrast-105"
               />
 
               {/* Atmospheric Dark Grid Overlay */}
@@ -1205,7 +1716,7 @@ export default function MapInterface({
                         setSelectedLocation(loc);
                         setMobileTab("details");
                       }}
-                      className={`relative p-2 rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
+                      className={`relative ${pinSizeCfg.realmBtn} rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
                         isPartyHere
                           ? "bg-amber-500 border-amber-200 ring-4 ring-amber-500/40 scale-125"
                           : isNodeSelected
@@ -1219,11 +1730,11 @@ export default function MapInterface({
                     >
                       {/* Location Icon or custom avatar */}
                       {loc.imageUrl ? (
-                        <div className="w-6 h-6 rounded-full overflow-hidden">
+                        <div className={`${pinSizeCfg.realmImg} rounded-full overflow-hidden`}>
                           <img src={loc.imageUrl} alt={loc.name} className="w-full h-full object-cover" />
                         </div>
                       ) : (
-                        <span className="text-sm select-none">{getLocationIcon(loc.type)}</span>
+                        <span className={`${pinSizeCfg.realmEmoji} select-none leading-none`}>{getLocationIcon(loc.type)}</span>
                       )}
 
                       {/* Party active beacon ping */}
@@ -1234,7 +1745,7 @@ export default function MapInterface({
                       {/* RED CROSS 'X' ACROSS MAP LOCATION INDICATING BOSS HAS BEEN SLAIN */}
                       {isBossSlain && (
                         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                          <svg className="w-9 h-9 text-red-500 drop-shadow-[0_0_8px_rgba(239,68,68,0.9)]" viewBox="0 0 40 40">
+                          <svg className={`${pinSizeCfg.realmSlay} text-red-500 drop-shadow-[0_0_8px_rgba(239,68,68,0.9)]`} viewBox="0 0 40 40">
                             {/* Crimson slashed X strokes */}
                             <line x1="6" y1="6" x2="34" y2="34" stroke="#ef4444" strokeWidth="5.5" strokeLinecap="round" />
                             <line x1="34" y1="6" x2="6" y2="34" stroke="#ef4444" strokeWidth="5.5" strokeLinecap="round" />
@@ -1252,7 +1763,7 @@ export default function MapInterface({
 
                       {/* Condition Aura Badge */}
                       {loc.condition && loc.condition !== "normal" && (
-                        <span className="absolute -bottom-1 -right-1 text-2xs">
+                        <span className="absolute -bottom-1 -right-1 text-[9px]">
                           {loc.condition === "cleared" ? "🛡️" : loc.condition === "besieged" ? "⚔️" : loc.condition === "cursed" ? "☠️" : "⚠️"}
                         </span>
                       )}
@@ -1260,9 +1771,9 @@ export default function MapInterface({
 
                     {/* LABEL BUBBLE BELOW PIN */}
                     {showTownNames && (
-                      <div className="absolute top-9 left-1/2 transform -translate-x-1/2 flex flex-col items-center select-none pointer-events-none z-30">
+                      <div className={`absolute ${pinSizeCfg.realmLabelTop} left-1/2 transform -translate-x-1/2 flex flex-col items-center select-none pointer-events-none z-30`}>
                         <span
-                          className={`whitespace-nowrap text-3xs font-mono rounded px-1.5 py-0.5 border shadow-lg transition-all flex items-center gap-1 ${
+                          className={`whitespace-nowrap ${pinSizeCfg.realmLabelText} font-mono rounded border shadow-lg transition-all flex items-center gap-1 ${
                             isPartyHere
                               ? "bg-amber-950 text-amber-200 border-amber-400 font-bold"
                               : isNodeSelected
@@ -1303,7 +1814,7 @@ export default function MapInterface({
               {/* LEVEL 2: CITY MAP BUILDING PINS */}
               {mapNavLevel === "city" && (
                 <>
-                  {(currentCityLocation?.cityBuildings || []).map((bld) => {
+                  {visibleCityBuildings.map((bld) => {
                     const isBldSelected = selectedBuilding?.id === bld.id;
                     const isBossSlain = !!bld.bossSlain;
 
@@ -1319,20 +1830,28 @@ export default function MapInterface({
                             setSelectedBuilding(bld);
                             setMobileTab("details");
                           }}
-                          className={`relative p-2.5 rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
+                          className={`relative ${pinSizeCfg.bldBtn} rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
                             isBldSelected
                               ? "bg-amber-500 border-amber-200 ring-4 ring-amber-500/50 scale-125"
+                              : bld.isHidden
+                              ? "bg-purple-950/85 border-purple-400/70 border-dashed hover:scale-115"
                               : isBossSlain
                               ? "bg-slate-900 border-red-500 hover:scale-115"
                               : "bg-[#141624] hover:bg-[#202438] border-amber-500/40 hover:scale-115"
                           }`}
                         >
-                          <span className="text-base select-none">{getBuildingIcon(bld.type)}</span>
+                          <span className={`${pinSizeCfg.bldEmoji} select-none leading-none`}>{getBuildingIcon(bld.type)}</span>
+
+                          {bld.isHidden && (
+                            <span className="absolute -top-1.5 -right-1.5 bg-purple-900 border border-purple-400 rounded-full p-0.5 text-purple-200">
+                              <EyeOff className="w-2.5 h-2.5" />
+                            </span>
+                          )}
 
                           {/* Red X if boss slain */}
                           {isBossSlain && (
                             <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                              <svg className="w-9 h-9 text-red-500 drop-shadow-[0_0_8px_rgba(239,68,68,0.9)]" viewBox="0 0 40 40">
+                              <svg className={`${pinSizeCfg.bldSlay} text-red-500 drop-shadow-[0_0_8px_rgba(239,68,68,0.9)]`} viewBox="0 0 40 40">
                                 <line x1="6" y1="6" x2="34" y2="34" stroke="#ef4444" strokeWidth="5.5" strokeLinecap="round" />
                                 <line x1="34" y1="6" x2="6" y2="34" stroke="#ef4444" strokeWidth="5.5" strokeLinecap="round" />
                                 <circle cx="20" cy="20" r="4" fill="#000" stroke="#ef4444" strokeWidth="1.5" />
@@ -1343,8 +1862,8 @@ export default function MapInterface({
 
                         {/* Building Name Tag */}
                         {showTownNames && (
-                          <div className="absolute top-11 left-1/2 transform -translate-x-1/2 pointer-events-none whitespace-nowrap z-10">
-                            <span className="bg-black/90 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded text-3xs font-mono font-bold shadow-lg">
+                          <div className={`absolute ${pinSizeCfg.bldLabelTop} left-1/2 transform -translate-x-1/2 pointer-events-none whitespace-nowrap z-10`}>
+                            <span className={`bg-black/90 text-amber-300 border border-amber-500/30 rounded font-mono font-bold shadow-lg ${pinSizeCfg.bldLabelText}`}>
                               {bld.name}
                             </span>
                           </div>
@@ -1371,8 +1890,8 @@ export default function MapInterface({
               )}
 
               {/* LEVEL 3: TAVERN INTERIOR ROOM / MAP PROMPT */}
-              {mapNavLevel === "tavern" && currentBuilding && (
-                <div className="absolute inset-0 flex items-center justify-center p-6 pointer-events-none">
+              {mapNavLevel === "tavern" && currentBuilding && (isDmMode || isPointVisibleToPlayers(currentBuilding.fogOfWar, 50, 50, mapAspect)) && (
+                <div className="absolute inset-0 flex items-center justify-center p-6 pointer-events-none z-20">
                   <div className="bg-black/85 backdrop-blur-md border border-amber-500/40 rounded-2xl p-6 text-center max-w-md shadow-2xl pointer-events-auto space-y-3">
                     <span className="text-4xl">{getBuildingIcon(currentBuilding.type)}</span>
                     <h3 className="font-serif italic text-xl text-amber-400 font-bold">
@@ -1399,6 +1918,17 @@ export default function MapInterface({
                   </div>
                 </div>
               )}
+
+              {/* UNIFIED FOG OF WAR OVERLAY (REALM, CITY, TAVERN) */}
+              <FogOfWarOverlay
+                fogOfWar={activeFogOfWar}
+                aspect={mapAspect}
+                isDmMode={isDmMode}
+                brushMode={fogBrushMode}
+                brushRadius={fogBrushRadius}
+                onUpdateFog={handleUpdateActiveFog}
+                zIndexClass="z-[25]"
+              />
             </div>
           </div>
         </div>
@@ -1506,7 +2036,7 @@ export default function MapInterface({
                   })}
               </div>
             </div>
-          ) : mapNavLevel === "city" && selectedBuilding ? (
+          ) : mapNavLevel === "city" && canViewSelectedBuilding && selectedBuilding ? (
             /* VIEW C: SELECTED CITY BUILDING INSPECTOR */
             <div className="space-y-4">
               <div className="flex items-start justify-between border-b border-white/10 pb-3">
@@ -1528,13 +2058,22 @@ export default function MapInterface({
                 </div>
 
                 {isDmMode && (
-                  <button
-                    onClick={() => handleDeleteBuilding(selectedBuilding.id)}
-                    className="p-1.5 bg-white/5 hover:bg-red-950/50 border border-white/10 text-slate-400 hover:text-red-400 rounded-lg transition-colors cursor-pointer"
-                    title="Remove building pin"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  <div className="flex items-center space-x-1 shrink-0">
+                    <button
+                      onClick={() => openEditBuildingModal(selectedBuilding)}
+                      className="p-1.5 bg-white/5 hover:bg-white/15 border border-white/10 text-amber-400 hover:text-amber-300 rounded-lg transition-colors cursor-pointer"
+                      title="Edit POI details, picture & coordinates"
+                    >
+                      <Edit2 className="w-4 h-4" />
+                    </button>
+                    <button
+                      onClick={() => handleDeleteBuilding(selectedBuilding.id)}
+                      className="p-1.5 bg-white/5 hover:bg-red-950/50 border border-white/10 text-slate-400 hover:text-red-400 rounded-lg transition-colors cursor-pointer"
+                      title="Remove building pin"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
                 )}
               </div>
 
@@ -1556,41 +2095,42 @@ export default function MapInterface({
 
               {/* Actions */}
               <div className="space-y-2 pt-2 border-t border-white/10">
-                {/* Enter Tavern / Building Map */}
+                {/* Enter Tavern / Shop / Building Tactical Combat Grid */}
                 <button
                   onClick={() => handleEnterTavernMap(selectedBuilding)}
-                  className="w-full py-2.5 px-4 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-black font-mono font-bold text-xs uppercase tracking-wider rounded-xl transition-all shadow-lg flex items-center justify-center space-x-2 cursor-pointer"
-                >
-                  <Map className="w-4 h-4" />
-                  <span>🍺 Enter Tavern / Building Map</span>
-                </button>
-
-                {/* Open Battle Grid */}
-                <button
-                  onClick={handleOpenTacticalBattleGrid}
-                  className="w-full py-2 px-4 bg-gradient-to-r from-red-700 to-red-600 hover:from-red-600 hover:to-red-500 text-white font-mono font-bold text-xs uppercase tracking-wider rounded-xl transition-all flex items-center justify-center space-x-2 cursor-pointer"
+                  className="w-full py-2.5 px-4 bg-gradient-to-r from-red-700 to-red-600 hover:from-red-600 hover:to-red-500 text-white font-mono font-bold text-xs uppercase tracking-wider rounded-xl transition-all shadow-lg flex items-center justify-center space-x-2 cursor-pointer"
                 >
                   <Swords className="w-4 h-4" />
-                  <span>⚔️ Open Tactical Combat Grid</span>
+                  <span>⚔️ Enter Interior & Tactical Combat Grid</span>
                 </button>
 
-                {/* Toggle Boss Slain (Red X) */}
+                {/* DM Reposition Pin & Boss Slain Controls */}
                 {isDmMode && (
-                  <button
-                    onClick={() => handleToggleBuildingBossSlain(selectedBuilding.id)}
-                    className={`w-full py-2 px-3 rounded-xl border font-mono text-2xs uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
-                      selectedBuilding.bossSlain
-                        ? "bg-red-950/60 border-red-500 text-red-300 font-bold"
-                        : "bg-[#141622] border-white/10 text-slate-400 hover:text-white"
-                    }`}
-                  >
-                    <Skull className="w-3.5 h-3.5 text-red-400" />
-                    <span>{selectedBuilding.bossSlain ? "Boss Slain (X) - Cleared" : "Mark Boss Slain (Red X)"}</span>
-                  </button>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => setRepositioningBuildingId(selectedBuilding.id)}
+                      className="py-2 px-3 bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 hover:text-white rounded-xl text-2xs font-mono uppercase transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Move className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Relocate Pin</span>
+                    </button>
+
+                    <button
+                      onClick={() => handleToggleBuildingBossSlain(selectedBuilding.id)}
+                      className={`py-2 px-3 rounded-xl border font-mono text-2xs uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                        selectedBuilding.bossSlain
+                          ? "bg-red-950/60 border-red-500 text-red-300 font-bold"
+                          : "bg-[#141622] border-white/10 text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <Skull className="w-3.5 h-3.5 text-red-400" />
+                      <span>{selectedBuilding.bossSlain ? "Cleared (X)" : "Boss Slain"}</span>
+                    </button>
+                  </div>
                 )}
               </div>
             </div>
-          ) : selectedLocation ? (
+          ) : canViewSelectedLocation && selectedLocation ? (
             /* VIEW B: SELECTED LOCATION DETAILS & CONTROLS */
             <div className="space-y-4">
               {/* Header */}
@@ -1680,7 +2220,10 @@ export default function MapInterface({
 
                 {/* 1. Enter Interior Battle Map */}
                 <button
-                  onClick={() => setInsideBattleMapLocation(selectedLocation)}
+                  onClick={() => {
+                    setInsideBattleMapBuildingId(null);
+                    setInsideBattleMapLocation(selectedLocation);
+                  }}
                   className="w-full py-2.5 px-4 bg-gradient-to-r from-red-650 to-red-600 hover:from-red-550 hover:to-red-500 text-white font-mono font-bold text-xs uppercase tracking-wider rounded-xl transition-all shadow-lg flex items-center justify-center space-x-2 cursor-pointer"
                 >
                   <Swords className="w-4 h-4" />
@@ -1850,7 +2393,7 @@ export default function MapInterface({
                     />
                   </div>
 
-                  {/* Type & Danger Level */}
+                  {/* Type & Condition */}
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="block text-2xs uppercase font-mono text-slate-400 font-bold mb-1">
@@ -1861,13 +2404,11 @@ export default function MapInterface({
                         onChange={(e) => setEditType(e.target.value as LocationType)}
                         className="w-full bg-[#161824] border border-white/10 text-slate-200 p-2 rounded-lg text-xs focus:outline-none focus:border-amber-500"
                       >
-                        <option value="town">Town / Tavern 🏰</option>
-                        <option value="dungeon">Dungeon / Vault 💀</option>
-                        <option value="forest">Mystic Forest 🌲</option>
-                        <option value="ruins">Ancient Ruins 🏚️</option>
-                        <option value="castle">Stronghold 🛡️</option>
-                        <option value="cave">Cave / Underdark 🕳️</option>
-                        <option value="shrine">Mystic Shrine 🔮</option>
+                        {LOCATION_TYPE_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
                       </select>
                     </div>
 
@@ -1889,10 +2430,42 @@ export default function MapInterface({
                     </div>
                   </div>
 
+                  {/* Direct Numeric Pin Coordinates */}
+                  <div className="grid grid-cols-2 gap-3 bg-[#141624] p-2.5 rounded-xl border border-white/5">
+                    <div>
+                      <label className="block text-2xs uppercase font-mono text-amber-400 font-bold mb-1">
+                        Pin X Position (%)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min={0.5}
+                        max={99.5}
+                        value={editLocX}
+                        onChange={(e) => setEditLocX(parseFloat(e.target.value) || 0.5)}
+                        className="w-full bg-[#161824] border border-white/10 text-white px-2.5 py-1.5 rounded-lg text-xs font-mono focus:outline-none focus:border-amber-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-2xs uppercase font-mono text-amber-400 font-bold mb-1">
+                        Pin Y Position (%)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min={0.5}
+                        max={99.5}
+                        value={editLocY}
+                        onChange={(e) => setEditLocY(parseFloat(e.target.value) || 0.5)}
+                        className="w-full bg-[#161824] border border-white/10 text-white px-2.5 py-1.5 rounded-lg text-xs font-mono focus:outline-none focus:border-amber-500"
+                      />
+                    </div>
+                  </div>
+
                   {/* Custom Location Image */}
                   <div>
                     <label className="block text-2xs uppercase font-mono text-slate-400 font-bold mb-1">
-                      Location Image (Upload or Web URL)
+                      Location Image (Upload, URL, or Saved Picture)
                     </label>
                     <div className="flex gap-2">
                       <input
@@ -1923,6 +2496,7 @@ export default function MapInterface({
                         <img src={editImageUrl} alt="Preview" className="w-full h-full object-cover" />
                       </div>
                     )}
+                    {renderSavedImagesPicker((url) => setEditImageUrl(url), editImageUrl)}
                   </div>
 
                   {/* Toggles: Boss Slain & Hidden */}
@@ -2240,16 +2814,14 @@ export default function MapInterface({
                     </label>
                     <select
                       value={newBuildingType}
-                      onChange={(e) => setNewBuildingType(e.target.value as any)}
+                      onChange={(e) => setNewBuildingType(e.target.value as BuildingType)}
                       className="w-full bg-[#161824] border border-white/10 text-slate-200 p-2 rounded-lg text-xs focus:outline-none focus:border-amber-500"
                     >
-                      <option value="tavern">Tavern & Taproom 🍺</option>
-                      <option value="shop">Market & Shop 🛒</option>
-                      <option value="guild">Guildhall 🛡️</option>
-                      <option value="temple">Temple & Sanctuary ⛩️</option>
-                      <option value="civic">Palace / Civic Hall 🏛️</option>
-                      <option value="residence">Noble Residence 🏡</option>
-                      <option value="ruin">Ancient Ruins 🏚️</option>
+                      {BUILDING_TYPE_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
                     </select>
                   </div>
 
@@ -2310,6 +2882,7 @@ export default function MapInterface({
                       <img src={newBuildingImageUrl} alt="Preview" className="w-full h-full object-cover" />
                     </div>
                   )}
+                  {renderSavedImagesPicker((url) => setNewBuildingImageUrl(url), newBuildingImageUrl)}
                 </div>
 
                 <div className="flex gap-2 pt-2">
@@ -2325,6 +2898,190 @@ export default function MapInterface({
                       setTempBuildingCoords(null);
                       setIsAddingBuilding(false);
                     }}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-mono cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ========================================================= */}
+      {/* MODAL 2C: EDIT CITY BUILDING / POI DETAILS & COORDINATES */}
+      {/* ========================================================= */}
+      <AnimatePresence>
+        {editingBuilding && currentCityLocation && (
+          <div className="fixed inset-0 z-60 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="w-full max-w-md bg-[#0f111a] border border-amber-500/40 rounded-2xl p-5 shadow-2xl space-y-3.5 font-sans text-slate-200 max-h-[90vh] overflow-y-auto"
+            >
+              <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
+                <div className="flex items-center space-x-2">
+                  <Edit2 className="w-5 h-5 text-amber-500" />
+                  <h3 className="text-base font-bold text-white font-serif italic">
+                    Edit POI: {editingBuilding.name}
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEditingBuilding(null)}
+                  className="text-slate-400 hover:text-white cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form onSubmit={handleSaveBuildingEdit} className="space-y-3 text-xs">
+                <div>
+                  <label className="block text-2xs uppercase font-mono text-slate-400 mb-1">
+                    POI Name
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={editBldName}
+                    onChange={(e) => setEditBldName(e.target.value)}
+                    className="w-full bg-[#161824] border border-white/10 text-white p-2 rounded-lg text-xs focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-2xs uppercase font-mono text-slate-400 mb-1">
+                    POI Category
+                  </label>
+                  <select
+                    value={editBldType}
+                    onChange={(e) => setEditBldType(e.target.value as BuildingType)}
+                    className="w-full bg-[#161824] border border-white/10 text-slate-200 p-2 rounded-lg text-xs focus:outline-none focus:border-amber-500"
+                  >
+                    {BUILDING_TYPE_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 bg-[#141624] p-2.5 rounded-xl border border-white/5">
+                  <div>
+                    <label className="block text-2xs uppercase font-mono text-amber-400 font-bold mb-1">
+                      Pin X Position (%)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min={0.5}
+                      max={99.5}
+                      value={editBldX}
+                      onChange={(e) => setEditBldX(parseFloat(e.target.value) || 0.5)}
+                      className="w-full bg-[#161824] border border-white/10 text-white p-1.5 rounded-lg text-xs font-mono focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-2xs uppercase font-mono text-amber-400 font-bold mb-1">
+                      Pin Y Position (%)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min={0.5}
+                      max={99.5}
+                      value={editBldY}
+                      onChange={(e) => setEditBldY(parseFloat(e.target.value) || 0.5)}
+                      className="w-full bg-[#161824] border border-white/10 text-white p-1.5 rounded-lg text-xs font-mono focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-2xs uppercase font-mono text-slate-400 mb-1">
+                    Description & Lore
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={editBldDesc}
+                    onChange={(e) => setEditBldDesc(e.target.value)}
+                    className="w-full bg-[#161824] border border-white/10 text-slate-200 p-2 rounded-lg text-xs focus:outline-none focus:border-amber-500 font-serif italic"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-2xs uppercase font-mono text-slate-400 mb-1">
+                    Building or Interior Picture
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="url"
+                      placeholder="https://..."
+                      value={editBldImageUrl}
+                      onChange={(e) => setEditBldImageUrl(e.target.value)}
+                      className="flex-1 bg-[#161824] border border-white/10 text-slate-200 p-2 rounded-lg text-xs font-mono focus:outline-none focus:border-amber-500"
+                    />
+                    <input
+                      type="file"
+                      ref={editBldFileInputRef}
+                      accept="image/*"
+                      onChange={handleEditBuildingImageUpload}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => editBldFileInputRef.current?.click()}
+                      className="px-3 bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 rounded-lg text-xs font-mono flex items-center gap-1 cursor-pointer"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>Upload</span>
+                    </button>
+                  </div>
+                  {editBldImageUrl && (
+                    <div className="mt-2 h-16 w-32 rounded-lg overflow-hidden border border-white/10">
+                      <img src={editBldImageUrl} alt="Preview" className="w-full h-full object-cover" />
+                    </div>
+                  )}
+                  {renderSavedImagesPicker((url) => setEditBldImageUrl(url), editBldImageUrl)}
+                </div>
+
+                <div className="bg-[#141624] p-2.5 rounded-xl border border-white/5 space-y-2">
+                  <label className="flex items-center space-x-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={editBldBossSlain}
+                      onChange={(e) => setEditBldBossSlain(e.target.checked)}
+                      className="rounded bg-[#1a1d2e] border-white/20 text-red-600 focus:ring-0"
+                    />
+                    <span className="text-2xs text-red-400 font-mono font-bold">
+                      💀 Threat Cleared / Boss Slain (Red X)
+                    </span>
+                  </label>
+                  <label className="flex items-center space-x-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={editBldIsHidden}
+                      onChange={(e) => setEditBldIsHidden(e.target.checked)}
+                      className="rounded bg-[#1a1d2e] border-white/20 text-purple-600 focus:ring-0"
+                    />
+                    <span className="text-2xs text-purple-300 font-mono font-bold">
+                      👁️ Hidden from Players (DM Secret POI)
+                    </span>
+                  </label>
+                </div>
+
+                <div className="flex gap-2 pt-2">
+                  <button
+                    type="submit"
+                    className="flex-1 py-2 bg-amber-500 hover:bg-amber-400 text-black font-mono font-bold text-xs uppercase rounded-lg transition-colors cursor-pointer"
+                  >
+                    Save POI Changes
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditingBuilding(null)}
                     className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-mono cursor-pointer"
                   >
                     Cancel
@@ -2369,6 +3126,42 @@ export default function MapInterface({
                   <span className="hidden sm:inline">Change Map Image</span>
                 </button>
 
+                {mapNavLevel === "city" && isDmMode && (
+                  <button
+                    onClick={() => setIsAddingBuilding(!isAddingBuilding)}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 cursor-pointer transition-all ${
+                      isAddingBuilding ? "bg-amber-500 text-black" : "bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30"
+                    }`}
+                    title="Click map to place a tavern, inn, shop, or landmark pin"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>{isAddingBuilding ? "Cancel POI" : "+ Add POI Pin"}</span>
+                  </button>
+                )}
+
+                {mapNavLevel !== "realm" && (
+                  <button
+                    onClick={handleReturnToRealm}
+                    className="px-2.5 py-1.5 bg-white/10 hover:bg-white/20 text-slate-200 rounded-lg text-xs font-mono cursor-pointer"
+                  >
+                    ← Realm Map
+                  </button>
+                )}
+
+                {isDmMode && (
+                  <button
+                    onClick={handleToggleFogToolbarOrEnable}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-bold flex items-center gap-1.5 border cursor-pointer ${
+                      activeFogOfWar?.enabled
+                        ? "bg-purple-600/30 text-purple-200 border-purple-400/60"
+                        : "bg-[#171a26] hover:bg-[#202436] text-slate-200 border-white/10"
+                    }`}
+                  >
+                    <Cloud className="w-3.5 h-3.5 text-purple-400" />
+                    <span>{activeFogOfWar?.enabled ? "☁️ Fog: ON" : "☁️ Fog of War"}</span>
+                  </button>
+                )}
+
                 <button
                   onClick={() => setIsDmMode(!isDmMode)}
                   className={`px-2.5 py-1.5 rounded-lg text-xs font-mono flex items-center gap-1.5 cursor-pointer ${
@@ -2388,6 +3181,97 @@ export default function MapInterface({
               </div>
             </div>
 
+            {/* Big Map DM Fog of War Toolbar */}
+            {isDmMode && isFogToolbarOpen && (
+              <div className="bg-[#151224] border-b border-purple-500/40 px-4 py-2 flex flex-wrap items-center justify-between gap-2 text-xs font-mono shrink-0 z-40">
+                <div className="flex items-center flex-wrap gap-2">
+                  <span className="text-purple-300 font-bold flex items-center gap-1">
+                    <Cloud className="w-4 h-4 text-purple-400" />
+                    <span>Fog of War:</span>
+                  </span>
+                  <button
+                    onClick={() => setFogBrushMode(fogBrushMode === "reveal" ? "off" : "reveal")}
+                    className={`px-2.5 py-1 rounded-lg border font-bold flex items-center gap-1 cursor-pointer ${
+                      fogBrushMode === "reveal"
+                        ? "bg-amber-500 text-black border-amber-300 shadow"
+                        : "bg-white/5 hover:bg-white/10 text-slate-200 border-white/15"
+                    }`}
+                  >
+                    <Eraser className="w-3.5 h-3.5" />
+                    <span>Clear Fog (Reveal)</span>
+                  </button>
+                  <button
+                    onClick={() => setFogBrushMode(fogBrushMode === "hide" ? "off" : "hide")}
+                    className={`px-2.5 py-1 rounded-lg border font-bold flex items-center gap-1 cursor-pointer ${
+                      fogBrushMode === "hide"
+                        ? "bg-purple-500 text-white border-purple-300 shadow"
+                        : "bg-white/5 hover:bg-white/10 text-slate-200 border-white/15"
+                    }`}
+                  >
+                    <Cloud className="w-3.5 h-3.5" />
+                    <span>Add Fog (Cover)</span>
+                  </button>
+                  <div className="flex items-center bg-black/40 border border-white/10 rounded-lg p-0.5">
+                    {[{ label: "S", r: 6 }, { label: "M", r: 12 }, { label: "L", r: 22 }].map((sz) => (
+                      <button
+                        key={sz.label}
+                        onClick={() => setFogBrushRadius(sz.r)}
+                        className={`px-2 py-0.5 rounded text-2xs font-bold cursor-pointer ${
+                          fogBrushRadius === sz.r ? "bg-purple-500 text-white" : "text-slate-400 hover:text-white"
+                        }`}
+                      >
+                        {sz.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex items-center flex-wrap gap-1.5">
+                  <button
+                    onClick={() => {
+                      const strokes = activeFogOfWar?.strokes || [];
+                      if (strokes.length > 0) {
+                        handleUpdateActiveFog({ enabled: true, strokes: strokes.slice(0, -1) });
+                      }
+                    }}
+                    disabled={!activeFogOfWar?.strokes?.length}
+                    className="px-2 py-1 bg-white/5 hover:bg-white/10 disabled:opacity-40 text-slate-200 rounded-lg border border-white/10 flex items-center gap-1 cursor-pointer"
+                  >
+                    <Undo2 className="w-3 h-3" />
+                    <span>Undo</span>
+                  </button>
+                  <button
+                    onClick={() => handleUpdateActiveFog({ enabled: true, strokes: [] })}
+                    className="px-2 py-1 bg-purple-950/60 hover:bg-purple-900/70 text-purple-200 rounded-lg border border-purple-500/30 cursor-pointer"
+                  >
+                    Cover All
+                  </button>
+                  <button
+                    onClick={() => handleUpdateActiveFog({ enabled: true, strokes: [{ x: 50, y: 50, r: 150, mode: "reveal" }] })}
+                    className="px-2 py-1 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 rounded-lg border border-amber-500/30 cursor-pointer"
+                  >
+                    Reveal All
+                  </button>
+                  <button
+                    onClick={() => {
+                      handleUpdateActiveFog({ enabled: false, strokes: activeFogOfWar?.strokes || [] });
+                      setFogBrushMode("off");
+                      setIsFogToolbarOpen(false);
+                    }}
+                    className="px-2 py-1 bg-red-950/50 hover:bg-red-900/60 text-red-300 rounded-lg border border-red-500/30 flex items-center gap-1 cursor-pointer"
+                  >
+                    <CloudOff className="w-3 h-3" />
+                    <span>Turn Off Fog</span>
+                  </button>
+                  <button
+                    onClick={() => { setFogBrushMode("off"); setIsFogToolbarOpen(false); }}
+                    className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg cursor-pointer"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Big Map Body with Floating HUD and Pannable Canvas */}
             <div 
               ref={bigMapContainerRef}
@@ -2399,67 +3283,131 @@ export default function MapInterface({
               onTouchMove={handleTouchMove}
               onTouchEnd={handleTouchEnd}
               onClick={handleMapCanvasClick}
-              className="relative flex-1 w-full h-full overflow-hidden select-none cursor-grab active:cursor-grabbing"
+              className={`relative flex-1 w-full h-full overflow-hidden select-none ${
+                repositioningLocId || repositioningBuildingId || isAddingLocation || isAddingBuilding
+                  ? "cursor-crosshair"
+                  : isDraggingMap
+                  ? "cursor-grabbing"
+                  : "cursor-grab"
+              }`}
             >
+              {/* Big Map Reposition / Add POI Active Notice Banner */}
+              {(repositioningLocId || repositioningBuildingId || (mapNavLevel === "city" && isAddingBuilding)) && (
+                <div className="absolute top-4 left-4 z-40 bg-amber-500 text-black px-3.5 py-2 rounded-xl text-xs font-mono font-bold flex items-center gap-3 shadow-2xl animate-pulse">
+                  <Move className="w-4 h-4 shrink-0" />
+                  <span>
+                    {repositioningBuildingId
+                      ? "Reposition POI Mode: Click anywhere on city map to move pin"
+                      : repositioningLocId
+                      ? "Reposition Mode: Click anywhere on map to move pin"
+                      : "Add POI Mode: Click anywhere on city map to plot Tavern/Landmark"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setRepositioningLocId(null);
+                      setRepositioningBuildingId(null);
+                      setIsAddingBuilding(false);
+                      setTempBuildingCoords(null);
+                    }}
+                    className="bg-black text-white px-2 py-0.5 rounded text-2xs uppercase cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+
               {/* Floating Big Map HUD */}
               <div className="absolute top-4 right-4 z-40 flex items-center space-x-2 bg-[#0e1017]/90 backdrop-blur-md p-1.5 rounded-xl border border-white/10 shadow-2xl">
-                {/* Uncropped 100% Fit Toggle */}
+                {/* Road Lines Toggle */}
                 <button
-                  onClick={() => setMapFitMode(m => m === "contain" ? "cover" : "contain")}
-                  className={`px-3 py-1.5 rounded-lg text-2xs font-mono font-bold flex items-center gap-1.5 border cursor-pointer ${
-                    mapFitMode === "contain"
+                  onClick={() => setShowLines((prev) => !prev)}
+                  className={`px-2.5 py-1.5 rounded-lg text-2xs font-mono font-bold flex items-center gap-1.5 border cursor-pointer ${
+                    showLines
                       ? "bg-amber-500/20 text-amber-300 border-amber-500/50"
-                      : "bg-[#1a1c28] text-slate-300 border-white/10 hover:text-white"
+                      : "bg-[#1a1c28] text-slate-400 border-white/10 hover:text-white"
                   }`}
-                  title="Toggle uncropped map picture vs fill screen"
+                  title="Toggle connecting road lines on map"
                 >
-                  <ImageIcon className="w-3.5 h-3.5 text-amber-400" />
-                  <span>{mapFitMode === "contain" ? "🖼️ Uncropped (100% Full View)" : "↔️ Fill Screen"}</span>
+                  <Route className="w-3.5 h-3.5 text-amber-400" />
+                  <span>{showLines ? "🛤️ Roads: ON" : "🛤️ Roads: OFF"}</span>
                 </button>
+
+                {/* Town Names Toggle */}
+                <button
+                  onClick={() => setShowTownNames((prev) => !prev)}
+                  className={`px-2.5 py-1.5 rounded-lg text-2xs font-mono font-bold flex items-center gap-1.5 border cursor-pointer ${
+                    showTownNames
+                      ? "bg-amber-500/20 text-amber-300 border-amber-500/50"
+                      : "bg-[#1a1c28] text-slate-400 border-white/10 hover:text-white"
+                  }`}
+                  title="Toggle town name badges"
+                >
+                  <Tag className="w-3.5 h-3.5 text-amber-400" />
+                  <span>{showTownNames ? "🏷️ Names: ON" : "🏷️ Names: OFF"}</span>
+                </button>
+
+                {/* Big Map Pin Size Selector */}
+                <div className="flex items-center bg-[#1a1c28] border border-white/10 rounded-lg p-0.5 text-3xs font-mono">
+                  <span className="px-1.5 text-slate-400">Pin:</span>
+                  {(["xs", "sm", "md"] as const).map((sz) => (
+                    <button
+                      key={`big-sz-${sz}`}
+                      onClick={() => setPinSize(sz)}
+                      className={`px-1.5 py-1 rounded uppercase font-bold cursor-pointer ${
+                        pinSize === sz ? "bg-amber-500 text-black" : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      {sz === "xs" ? "XS" : sz === "sm" ? "S" : "M"}
+                    </button>
+                  ))}
+                </div>
 
                 <button
                   onClick={() => setZoomScale((prev) => Math.min(3.5, parseFloat((prev + 0.25).toFixed(2))))}
-                  className="p-2 hover:bg-white/10 rounded-lg text-white"
+                  className="p-2 hover:bg-white/10 rounded-lg text-white cursor-pointer"
                   title="Zoom In"
                 >
                   <ZoomIn className="w-4 h-4" />
                 </button>
                 <button
                   onClick={() => setZoomScale((prev) => Math.max(0.6, parseFloat((prev - 0.25).toFixed(2))))}
-                  className="p-2 hover:bg-white/10 rounded-lg text-white"
+                  className="p-2 hover:bg-white/10 rounded-lg text-white cursor-pointer"
                   title="Zoom Out"
                 >
                   <ZoomOut className="w-4 h-4" />
                 </button>
                 <button
                   onClick={handleResetZoom}
-                  className="px-2.5 py-1 hover:bg-white/10 rounded-lg text-xs font-mono text-amber-400 font-bold"
+                  className="px-2.5 py-1 hover:bg-white/10 rounded-lg text-xs font-mono text-amber-400 font-bold cursor-pointer"
                   title="Reset View"
                 >
                   {Math.round(zoomScale * 100)}%
                 </button>
                 <button
                   onClick={handleCenterParty}
-                  className="p-2 hover:bg-amber-500/20 text-amber-400 rounded-lg"
+                  className="p-2 hover:bg-amber-500/20 text-amber-400 rounded-lg cursor-pointer"
                   title="Center Party"
                 >
                   <Compass className="w-4 h-4" />
                 </button>
               </div>
 
-              {/* Pan & Zoom Canvas */}
+              {/* Pan & Zoom Canvas (Identical Aspect-Ratio Surface as General Map) */}
               <div
+                ref={innerBigCanvasRef}
                 style={{
                   transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`,
                   transformOrigin: "center center",
                   transition: isDraggingMap ? "none" : "transform 0.08s ease-out",
-                  width: mapFitMode === "contain" && mapAspect ? `${mapAspect >= 1 ? "100%" : "auto"}` : "100%",
-                  height: mapFitMode === "contain" && mapAspect ? `${mapAspect < 1 ? "100%" : "auto"}` : "100%",
-                  aspectRatio: mapFitMode === "contain" && mapAspect ? `${mapAspect}` : undefined,
+                  width: mapAspect >= 1 ? "100%" : "auto",
+                  height: mapAspect < 1 ? "100%" : "auto",
+                  aspectRatio: `${mapAspect}`,
                   maxHeight: "100%",
                   maxWidth: "100%"
                 }}
-                className={`relative ${mapFitMode === "contain" ? "m-auto" : "w-full h-full"}`}
+                className="relative m-auto"
               >
                 <img
                   src={
@@ -2475,38 +3423,38 @@ export default function MapInterface({
                       setMapAspect(e.currentTarget.naturalWidth / e.currentTarget.naturalHeight);
                     }
                   }}
-                  className={`absolute inset-0 w-full h-full ${
-                    mapFitMode === "contain" ? "object-contain" : "object-cover"
-                  } pointer-events-none filter brightness-95`}
+                  className="absolute inset-0 w-full h-full object-fill pointer-events-none filter brightness-95"
                 />
 
                 {mapNavLevel === "realm" && (
                   <>
                     {/* SVG Connections */}
-                    <svg className="absolute inset-0 w-full h-full pointer-events-none">
-                      {visibleLocations.map((loc) => {
-                    return loc.connectedTo.map((connId) => {
-                      const dest = campaignState.locations.find((l) => l.id === connId);
-                      if (!dest) return null;
-                      if (!isDmMode && (dest.isHidden || loc.isHidden)) return null;
+                    {showLines && (
+                      <svg className="absolute inset-0 w-full h-full pointer-events-none">
+                        {visibleLocations.map((loc) => {
+                          return loc.connectedTo.map((connId) => {
+                            const dest = campaignState.locations.find((l) => l.id === connId);
+                            if (!dest) return null;
+                            if (!isDmMode && (dest.isHidden || loc.isHidden)) return null;
 
-                      const isSelected = selectedLocation && (selectedLocation.id === loc.id || selectedLocation.id === dest.id);
+                            const isSelected = selectedLocation && (selectedLocation.id === loc.id || selectedLocation.id === dest.id);
 
-                      return (
-                        <line
-                          key={`big-line-${loc.id}-${dest.id}`}
-                          x1={`${loc.x}%`}
-                          y1={`${loc.y}%`}
-                          x2={`${dest.x}%`}
-                          y2={`${dest.y}%`}
-                          stroke={isSelected ? "#f59e0b" : "rgba(245, 158, 11, 0.4)"}
-                          strokeWidth={isSelected ? "4" : "2"}
-                          strokeDasharray={(!loc.isDiscovered || !dest.isDiscovered) ? "6,6" : undefined}
-                        />
-                      );
-                    });
-                  })}
-                </svg>
+                            return (
+                              <line
+                                key={`big-line-${loc.id}-${dest.id}`}
+                                x1={`${loc.x}%`}
+                                y1={`${loc.y}%`}
+                                x2={`${dest.x}%`}
+                                y2={`${dest.y}%`}
+                                stroke={isSelected ? "#f59e0b" : "rgba(245, 158, 11, 0.4)"}
+                                strokeWidth={isSelected ? "4" : "2"}
+                                strokeDasharray={(!loc.isDiscovered || !dest.isDiscovered) ? "6,6" : undefined}
+                              />
+                            );
+                          });
+                        })}
+                      </svg>
+                    )}
 
                 {/* Big Map Pins */}
                 {visibleLocations.map((loc) => {
@@ -2525,7 +3473,7 @@ export default function MapInterface({
                           e.stopPropagation();
                           setSelectedLocation(loc);
                         }}
-                        className={`relative p-2.5 rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
+                        className={`relative ${pinSizeCfg.bigRealmBtn} rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
                           isPartyHere
                             ? "bg-amber-500 border-amber-200 ring-4 ring-amber-500/40 scale-135"
                             : isNodeSelected
@@ -2536,11 +3484,11 @@ export default function MapInterface({
                         }`}
                       >
                         {loc.imageUrl ? (
-                          <div className="w-8 h-8 rounded-full overflow-hidden">
+                          <div className={`${pinSizeCfg.bigRealmImg} rounded-full overflow-hidden`}>
                             <img src={loc.imageUrl} alt={loc.name} className="w-full h-full object-cover" />
                           </div>
                         ) : (
-                          <span className="text-lg select-none">{getLocationIcon(loc.type)}</span>
+                          <span className={`${pinSizeCfg.bigRealmEmoji} select-none leading-none`}>{getLocationIcon(loc.type)}</span>
                         )}
 
                         {isPartyHere && (
@@ -2550,7 +3498,7 @@ export default function MapInterface({
                         {/* RED X ACROSS BIG MAP LOCATION */}
                         {isBossSlain && (
                           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                            <svg className="w-11 h-11 text-red-500 drop-shadow-[0_0_10px_rgba(239,68,68,0.95)]" viewBox="0 0 40 40">
+                            <svg className={`${pinSizeCfg.bigRealmSlay} text-red-500 drop-shadow-[0_0_10px_rgba(239,68,68,0.95)]`} viewBox="0 0 40 40">
                               <line x1="5" y1="5" x2="35" y2="35" stroke="#ef4444" strokeWidth="6" strokeLinecap="round" />
                               <line x1="35" y1="5" x2="5" y2="35" stroke="#ef4444" strokeWidth="6" strokeLinecap="round" />
                               <circle cx="20" cy="20" r="4.5" fill="#000" stroke="#ef4444" strokeWidth="2" />
@@ -2559,12 +3507,14 @@ export default function MapInterface({
                         )}
                       </button>
 
-                      <div className="absolute top-11 left-1/2 transform -translate-x-1/2 flex flex-col items-center select-none pointer-events-none">
-                        <span className="whitespace-nowrap text-2xs font-mono rounded px-2 py-0.5 bg-black/90 text-white border border-white/10 font-bold shadow-lg">
-                          {isBossSlain && <span className="text-red-400 mr-1">✕</span>}
-                          {loc.name}
-                        </span>
-                      </div>
+                      {showTownNames && (
+                        <div className={`absolute ${pinSizeCfg.bigRealmLabelTop} left-1/2 transform -translate-x-1/2 flex flex-col items-center select-none pointer-events-none`}>
+                          <span className={`whitespace-nowrap ${pinSizeCfg.realmLabelText} font-mono rounded bg-black/90 text-white border border-white/10 font-bold shadow-lg`}>
+                            {isBossSlain && <span className="text-red-400 mr-1">✕</span>}
+                            {loc.name}
+                          </span>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -2574,7 +3524,7 @@ export default function MapInterface({
                 {/* Big Map City Building Pins */}
                 {mapNavLevel === "city" && (
                   <>
-                    {(currentCityLocation?.cityBuildings || []).map((bld) => {
+                    {visibleCityBuildings.map((bld) => {
                       const isBldSelected = selectedBuilding?.id === bld.id;
                       const isBossSlain = !!bld.bossSlain;
 
@@ -2589,19 +3539,21 @@ export default function MapInterface({
                               e.stopPropagation();
                               setSelectedBuilding(bld);
                             }}
-                            className={`relative p-3 rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
+                            className={`relative ${pinSizeCfg.bigBldBtn} rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
                               isBldSelected
                                 ? "bg-amber-500 border-amber-200 ring-4 ring-amber-500/50 scale-130"
+                                : bld.isHidden
+                                ? "bg-purple-950/85 border-purple-400/70 border-dashed"
                                 : isBossSlain
                                 ? "bg-slate-900 border-red-500"
                                 : "bg-[#141624] hover:bg-[#202438] border-amber-500/40 hover:scale-115"
                             }`}
                           >
-                            <span className="text-xl select-none">{getBuildingIcon(bld.type)}</span>
+                            <span className={`${pinSizeCfg.bigBldEmoji} select-none leading-none`}>{getBuildingIcon(bld.type)}</span>
 
                             {isBossSlain && (
                               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                                <svg className="w-11 h-11 text-red-500 drop-shadow-[0_0_10px_rgba(239,68,68,0.95)]" viewBox="0 0 40 40">
+                                <svg className={`${pinSizeCfg.bigBldSlay} text-red-500 drop-shadow-[0_0_10px_rgba(239,68,68,0.95)]`} viewBox="0 0 40 40">
                                   <line x1="5" y1="5" x2="35" y2="35" stroke="#ef4444" strokeWidth="6" strokeLinecap="round" />
                                   <line x1="35" y1="5" x2="5" y2="35" stroke="#ef4444" strokeWidth="6" strokeLinecap="round" />
                                   <circle cx="20" cy="20" r="4.5" fill="#000" stroke="#ef4444" strokeWidth="2" />
@@ -2610,23 +3562,108 @@ export default function MapInterface({
                             )}
                           </button>
 
-                          <div className="absolute top-12 left-1/2 transform -translate-x-1/2 flex flex-col items-center select-none pointer-events-none">
-                            <span className="whitespace-nowrap text-2xs font-mono rounded px-2 py-0.5 bg-black/90 text-amber-300 border border-amber-500/30 font-bold shadow-lg">
-                              {bld.name}
-                            </span>
-                          </div>
+                          {showTownNames && (
+                            <div className={`absolute ${pinSizeCfg.bigBldLabelTop} left-1/2 transform -translate-x-1/2 flex flex-col items-center select-none pointer-events-none`}>
+                              <span className={`whitespace-nowrap ${pinSizeCfg.bldLabelText} font-mono rounded bg-black/90 text-amber-300 border border-amber-500/30 font-bold shadow-lg`}>
+                                {bld.name}
+                              </span>
+                            </div>
+                          )}
                         </div>
                       );
                     })}
+
+                    {/* Temporary Plotted POI Reticle in Big Map City View */}
+                    {isAddingBuilding && tempBuildingCoords && (
+                      <div
+                        style={{ left: `${tempBuildingCoords.x}%`, top: `${tempBuildingCoords.y}%` }}
+                        className="absolute transform -translate-x-1/2 -translate-y-1/2 z-30 pointer-events-none"
+                      >
+                        <div className="p-3 rounded-full bg-amber-500 animate-pulse text-black font-bold select-none text-xl shadow-2xl border-2 border-white">
+                          {getBuildingIcon(newBuildingType)}
+                        </div>
+                        <span className="absolute top-11 left-1/2 transform -translate-x-1/2 bg-black/95 border border-amber-500 text-amber-300 text-2xs rounded px-2.5 py-0.5 whitespace-nowrap font-mono font-bold shadow-xl">
+                          POI Target: X:{tempBuildingCoords.x}% Y:{tempBuildingCoords.y}%
+                        </span>
+                      </div>
+                    )}
                   </>
                 )}
+
+                {/* BIG MAP FOG OF WAR OVERLAY */}
+                <FogOfWarOverlay
+                  fogOfWar={activeFogOfWar}
+                  aspect={mapAspect}
+                  isDmMode={isDmMode}
+                  brushMode={fogBrushMode}
+                  brushRadius={fogBrushRadius}
+                  onUpdateFog={handleUpdateActiveFog}
+                  zIndexClass="z-[25]"
+                />
               </div>
 
-              {/* Selected Location Floating Bar inside Big Map */}
-              {selectedLocation && (
-                <div className="absolute bottom-5 left-1/2 transform -translate-x-1/2 z-40 bg-[#0e1017]/95 border border-amber-500/40 p-3 sm:p-4 rounded-2xl shadow-2xl backdrop-blur-md flex items-center space-x-4 max-w-xl w-[90%]">
-                  <span className="text-2xl">{getLocationIcon(selectedLocation.type)}</span>
-                  <div className="flex-1 min-w-0">
+              {/* Floating Bottom Card: Building POI or Selected Location */}
+              {mapNavLevel === "city" && canViewSelectedBuilding && selectedBuilding ? (
+                <div className="absolute bottom-5 left-1/2 transform -translate-x-1/2 z-40 bg-[#0e1017]/95 border border-amber-500/40 p-3 sm:p-4 rounded-2xl shadow-2xl backdrop-blur-md flex flex-wrap items-center gap-3 max-w-3xl w-[92%]">
+                  <span className="text-3xl select-none">{getBuildingIcon(selectedBuilding.type)}</span>
+                  <div className="flex-1 min-w-[160px]">
+                    <div className="flex items-center gap-2">
+                      <h4 className="font-serif italic font-bold text-white text-sm sm:text-base truncate">
+                        {selectedBuilding.name}
+                      </h4>
+                      {selectedBuilding.bossSlain && (
+                        <span className="text-2xs font-mono text-red-400 font-bold bg-red-950/60 px-1.5 py-0.5 rounded border border-red-500/40">
+                          💀 CLEARED
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-3xs text-slate-300 font-serif italic truncate">
+                      "{selectedBuilding.description}"
+                    </p>
+                  </div>
+                  <div className="flex items-center flex-wrap gap-1.5 shrink-0">
+                    {isDmMode && (
+                      <>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openEditBuildingModal(selectedBuilding);
+                          }}
+                          className="px-2.5 py-2 bg-white/10 hover:bg-white/20 text-amber-300 font-mono text-xs rounded-xl flex items-center gap-1 cursor-pointer"
+                          title="Edit POI & coordinates"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                          <span>Edit</span>
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setRepositioningBuildingId(selectedBuilding.id);
+                          }}
+                          className="px-2.5 py-2 bg-white/10 hover:bg-white/20 text-slate-200 font-mono text-xs rounded-xl flex items-center gap-1 cursor-pointer"
+                          title="Click map to relocate pin"
+                        >
+                          <Move className="w-3.5 h-3.5 text-amber-400" />
+                          <span>Move Pin</span>
+                        </button>
+                      </>
+                    )}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleEnterTavernMap(selectedBuilding);
+                      }}
+                      className="px-3.5 py-2 bg-red-600 hover:bg-red-500 text-white font-mono font-bold text-xs uppercase rounded-xl transition-all shadow flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Swords className="w-3.5 h-3.5" />
+                      <span>Enter Combat Grid</span>
+                    </button>
+                  </div>
+                </div>
+              ) : canViewSelectedLocation && selectedLocation && (
+                <div className="absolute bottom-5 left-1/2 transform -translate-x-1/2 z-40 bg-[#0e1017]/95 border border-amber-500/40 p-3 sm:p-4 rounded-2xl shadow-2xl backdrop-blur-md flex flex-wrap items-center gap-3 max-w-3xl w-[92%]">
+                  <span className="text-2xl select-none">{getLocationIcon(selectedLocation.type)}</span>
+                  <div className="flex-1 min-w-[160px]">
                     <div className="flex items-center gap-2">
                       <h4 className="font-serif italic font-bold text-white text-sm sm:text-base truncate">
                         {selectedLocation.name}
@@ -2641,12 +3678,54 @@ export default function MapInterface({
                       "{selectedLocation.description}"
                     </p>
                   </div>
-                  <button
-                    onClick={() => setInsideBattleMapLocation(selectedLocation)}
-                    className="px-3.5 py-2 bg-red-600 hover:bg-red-500 text-white font-mono font-bold text-xs uppercase rounded-xl transition-all shadow shrink-0"
-                  >
-                    Battle Map
-                  </button>
+                  <div className="flex items-center flex-wrap gap-1.5 shrink-0">
+                    {isDmMode && (
+                      <>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openEditModal(selectedLocation);
+                          }}
+                          className="px-2.5 py-2 bg-white/10 hover:bg-white/20 text-amber-300 font-mono text-xs rounded-xl flex items-center gap-1 cursor-pointer"
+                          title="Edit location & coordinates"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                          <span>Edit</span>
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setRepositioningLocId(selectedLocation.id);
+                          }}
+                          className="px-2.5 py-2 bg-white/10 hover:bg-white/20 text-slate-200 font-mono text-xs rounded-xl flex items-center gap-1 cursor-pointer"
+                          title="Click map to relocate pin"
+                        >
+                          <Move className="w-3.5 h-3.5 text-amber-400" />
+                          <span>Move Pin</span>
+                        </button>
+                      </>
+                    )}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleEnterCityMap(selectedLocation);
+                      }}
+                      className="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-black font-mono font-bold text-xs uppercase rounded-xl transition-all shadow flex items-center gap-1 cursor-pointer"
+                    >
+                      <Map className="w-3.5 h-3.5" />
+                      <span>City Map</span>
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setInsideBattleMapBuildingId(null);
+                        setInsideBattleMapLocation(selectedLocation);
+                      }}
+                      className="px-3 py-2 bg-red-600 hover:bg-red-500 text-white font-mono font-bold text-xs uppercase rounded-xl transition-all shadow shrink-0 cursor-pointer"
+                    >
+                      Battle Map
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -2659,11 +3738,35 @@ export default function MapInterface({
       {/* ========================================================= */}
       {insideBattleMapLocation && (
         <SiteBattleMapModal
-          location={campaignState.locations.find(l => l.id === insideBattleMapLocation.id) || insideBattleMapLocation}
+          location={
+            insideBattleMapBuildingId
+              ? (() => {
+                  const freshCity = campaignState.locations.find(l => l.id === insideBattleMapLocation.id);
+                  const freshBld = freshCity?.cityBuildings?.find(b => b.id === insideBattleMapBuildingId);
+                  if (freshCity && freshBld) {
+                    return {
+                      ...freshCity,
+                      name: `${freshCity.name} - ${freshBld.name}`,
+                      interiorMaps: freshBld.interiorMaps || insideBattleMapLocation.interiorMaps,
+                      activeInteriorMapId: freshBld.interiorMaps?.[0]?.id || insideBattleMapLocation.activeInteriorMapId
+                    };
+                  }
+                  return insideBattleMapLocation;
+                })()
+              : (campaignState.locations.find(l => l.id === insideBattleMapLocation.id) || insideBattleMapLocation)
+          }
+          buildingId={insideBattleMapBuildingId || undefined}
           characters={campaignState.characters}
           partyLocationId={campaignState.partyLocationId}
-          onClose={() => setInsideBattleMapLocation(null)}
+          isDmMode={isDmMode}
+          onToggleDmMode={() => setIsDmMode((prev) => !prev)}
+          onClose={() => {
+            setInsideBattleMapLocation(null);
+            setInsideBattleMapBuildingId(null);
+          }}
           onSaveBattleMaps={onSaveBattleMaps || (async () => {})}
+          onUpdateFog={onUpdateFog}
+          savedImages={savedCampaignImages}
         />
       )}
 
@@ -2761,7 +3864,7 @@ export default function MapInterface({
                     Reset to Default
                   </button>
                 </div>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-44 overflow-y-auto pr-1">
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-36 overflow-y-auto pr-1">
                   {REGION_PRESETS.map((preset) => (
                     <div
                       key={preset.id}
@@ -2778,6 +3881,8 @@ export default function MapInterface({
                   ))}
                 </div>
               </div>
+
+              {renderSavedImagesPicker((url) => handleApplyRegionImage(url), activeRegion.backgroundUrl)}
 
             </motion.div>
           </div>
@@ -2852,6 +3957,8 @@ export default function MapInterface({
                   </button>
                 </div>
               </div>
+
+              {renderSavedImagesPicker((url) => handleApplyCityImage(url), currentCityLocation.cityMapImageUrl)}
             </motion.div>
           </div>
         )}
@@ -2925,6 +4032,8 @@ export default function MapInterface({
                   </button>
                 </div>
               </div>
+
+              {renderSavedImagesPicker((url) => handleApplyTavernImage(url), currentBuilding.imageUrl)}
             </motion.div>
           </div>
         )}

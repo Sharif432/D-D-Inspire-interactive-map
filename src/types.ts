@@ -20,7 +20,44 @@ export interface Character {
   avatarUrl: string;
 }
 
-export type LocationType = 'town' | 'dungeon' | 'forest' | 'ruins' | 'castle' | 'cave' | 'shrine';
+export type LocationType =
+  | 'town'
+  | 'village'
+  | 'dungeon'
+  | 'forest'
+  | 'ruins'
+  | 'castle'
+  | 'castle_wall'
+  | 'fortress'
+  | 'harbour'
+  | 'tower'
+  | 'bridge'
+  | 'camp'
+  | 'temple'
+  | 'market'
+  | 'mountain'
+  | 'swamp'
+  | 'desert'
+  | 'lake'
+  | 'cave'
+  | 'shrine';
+
+export type BuildingType =
+  | 'tavern'
+  | 'shop'
+  | 'guild'
+  | 'temple'
+  | 'residence'
+  | 'civic'
+  | 'ruin'
+  | 'harbour'
+  | 'castle_wall'
+  | 'barracks'
+  | 'market'
+  | 'stable'
+  | 'smith'
+  | 'library'
+  | 'prison';
 
 export interface MapToken {
   id: string;
@@ -38,6 +75,18 @@ export interface MapToken {
   notes?: string;
 }
 
+export interface FogOfWarShape {
+  x: number; // 0-100 percentage of map width
+  y: number; // 0-100 percentage of map height
+  r: number; // radius in percentage of map width
+  mode: 'reveal' | 'hide';
+}
+
+export interface FogOfWarState {
+  enabled: boolean;
+  strokes: FogOfWarShape[];
+}
+
 export interface SiteBattleMap {
   id: string;
   locationId: string;
@@ -52,19 +101,21 @@ export interface SiteBattleMap {
   gridColor?: string;
   tokens: MapToken[];
   subMaps?: SiteBattleMap[];
+  fogOfWar?: FogOfWarState;
 }
 
 export interface CityBuildingPin {
   id: string;
   name: string;
   description: string;
-  type: 'tavern' | 'shop' | 'guild' | 'temple' | 'residence' | 'civic' | 'ruin';
+  type: BuildingType;
   x: number; // percentage-based 0-100 on city map
   y: number; // percentage-based 0-100 on city map
   imageUrl?: string;
   isHidden?: boolean;
   bossSlain?: boolean;
   interiorMaps?: SiteBattleMap[];
+  fogOfWar?: FogOfWarState;
 }
 
 export interface CampaignLocation {
@@ -84,6 +135,7 @@ export interface CampaignLocation {
   isBossLocation?: boolean;
   cityMapImageUrl?: string;
   cityBuildings?: CityBuildingPin[];
+  cityFogOfWar?: FogOfWarState;
   interiorMaps?: SiteBattleMap[];
   activeInteriorMapId?: string;
 }
@@ -93,6 +145,7 @@ export interface Region {
   name: string;
   description: string;
   backgroundUrl: string;
+  fogOfWar?: FogOfWarState;
 }
 
 export interface JournalNote {
@@ -133,6 +186,12 @@ export interface InitiativeCombatant {
   isCustom?: boolean;
 }
 
+export interface CampaignMediaAsset {
+  id: string;
+  name: string;
+  url: string;
+}
+
 export interface CampaignState {
   campaignName?: string;
   partyName?: string;
@@ -146,4 +205,5 @@ export interface CampaignState {
   initiativeOrder?: InitiativeCombatant[];
   initiativeRound?: number;
   currentTurnIndex?: number;
+  mediaLibrary?: CampaignMediaAsset[];
 }

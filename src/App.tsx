@@ -7,7 +7,8 @@ import {
   LocationType, 
   InitiativeCombatant, 
   SiteBattleMap, 
-  CampaignLocation 
+  CampaignLocation,
+  FogOfWarState
 } from "./types";
 import { 
   BookOpen, 
@@ -23,6 +24,8 @@ import {
   Swords, 
   LayoutGrid, 
   Laptop,
+  Save,
+  FileJson,
   Check,
   X,
   Upload,
@@ -35,6 +38,7 @@ import MapInterface from "./components/MapInterface";
 import DiceRoller from "./components/DiceRoller";
 import InitiativeOrder from "./components/InitiativeOrder";
 import StandaloneModal from "./components/StandaloneModal";
+import { extractCampaignImages, processUploadedImage } from "./utils/imageUtils";
 import { motion, AnimatePresence } from "motion/react";
 
 export default function App() {
@@ -69,6 +73,7 @@ export default function App() {
     charisma: 10
   });
   const charFileInputRef = useRef<HTMLInputElement>(null);
+  const [characterToDelete, setCharacterToDelete] = useState<Character | null>(null);
 
   // New Hero addition state
   const [isAddingHero, setIsAddingHero] = useState(false);
@@ -184,13 +189,18 @@ export default function App() {
     }
   };
 
-  // Save / Update Battle Maps for a Location
-  const handleSaveBattleMaps = async (locationId: string, interiorMaps: SiteBattleMap[], activeInteriorMapId: string) => {
+  // Save / Update Battle Maps for a Location or Building
+  const handleSaveBattleMaps = async (
+    locationId: string,
+    interiorMaps: SiteBattleMap[],
+    activeInteriorMapId: string,
+    buildingId?: string
+  ) => {
     try {
       const res = await fetch("/api/campaign/location/battlemap", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ locationId, interiorMaps, activeInteriorMapId })
+        body: JSON.stringify({ locationId, buildingId, interiorMaps, activeInteriorMapId })
       });
       const data = await res.json();
       if (data.success && data.campaign) {
@@ -198,6 +208,30 @@ export default function App() {
       }
     } catch (err) {
       console.error("Save battle maps error:", err);
+    }
+  };
+
+  // Save / Update Fog of War on any Map Level
+  const handleUpdateFog = async (payload: {
+    targetType: "region" | "city" | "building" | "battlemap";
+    regionId?: string;
+    locationId?: string;
+    buildingId?: string;
+    mapId?: string;
+    fogOfWar: FogOfWarState;
+  }) => {
+    try {
+      const res = await fetch("/api/campaign/fog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        setState(data.campaign);
+      }
+    } catch (err) {
+      console.error("Update fog of war error:", err);
     }
   };
 
@@ -343,7 +377,6 @@ export default function App() {
 
   // Delete Character
   const handleDeleteCharacter = async (charId: string) => {
-    if (!window.confirm("Remove this hero from the party alliance?")) return;
     try {
       const res = await fetch("/api/campaign/character/delete", {
         method: "POST",
@@ -357,19 +390,19 @@ export default function App() {
           setSelectedCharacterId(data.campaign.characters[0].id);
         }
         setEditingCharacter(null);
+        setCharacterToDelete(null);
       }
     } catch (err) {
       console.error("Delete character error:", err);
     }
   };
 
-  // Character Avatar file upload
-  const handleCharAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>, isNewHero = false) => {
+  // Character Avatar file upload (auto-optimized for portable JSON export)
+  const handleCharAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>, isNewHero = false) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
+    try {
+      const dataUrl = await processUploadedImage(file);
       if (dataUrl) {
         if (isNewHero) {
           setHeroAvatarUrl(dataUrl);
@@ -377,8 +410,9 @@ export default function App() {
           setEditCharAvatarUrl(dataUrl);
         }
       }
-    };
-    reader.readAsDataURL(file);
+    } catch (err) {
+      console.error("Avatar upload error:", err);
+    }
   };
 
   // Add a Custom Hero to the Table
@@ -607,11 +641,11 @@ export default function App() {
             <button
               onClick={() => setIsStandaloneModalOpen(true)}
               className="flex items-center space-x-1.5 px-3 py-1.5 bg-gradient-to-r from-amber-500/15 to-amber-600/10 hover:from-amber-500/25 hover:to-amber-600/20 border border-amber-500/40 hover:border-amber-400 text-amber-300 rounded-lg text-xs font-mono transition-all cursor-pointer shadow-sm"
-              title="Download standalone desktop app (.exe & .zip) to run on your computer"
+              title="Export or Import Campaign Save Files (.json)"
             >
-              <Laptop className="w-3.5 h-3.5 text-amber-400" />
-              <span className="hidden sm:inline font-bold">Standalone App & Saves</span>
-              <span className="sm:hidden font-bold">.EXE</span>
+              <Save className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline font-bold">Save / Load (.json)</span>
+              <span className="sm:hidden font-bold">Save</span>
             </button>
 
             <div className="hidden lg:flex items-center gap-1 bg-emerald-950/40 border border-emerald-500/20 text-emerald-400 text-[10px] uppercase tracking-widest px-2.5 py-1 rounded-full font-mono font-semibold">
@@ -797,17 +831,32 @@ export default function App() {
                       <span>CON {char.stats?.constitution || 10}</span>
                     </div>
 
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        openEditCharacter(char);
-                      }}
-                      className="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 hover:text-white border border-amber-500/30 rounded text-[9px] font-mono uppercase flex items-center gap-1 transition-all cursor-pointer"
-                      title="Edit hero name, picture, class, HP and stats"
-                    >
-                      <Edit2 className="w-2.5 h-2.5 text-amber-400" />
-                      <span>Edit Hero</span>
-                    </button>
+                    <div className="flex items-center space-x-1.5">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openEditCharacter(char);
+                        }}
+                        className="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 hover:text-white border border-amber-500/30 rounded text-[9px] font-mono uppercase flex items-center gap-1 transition-all cursor-pointer"
+                        title="Edit hero name, picture, class, HP and stats"
+                      >
+                        <Edit2 className="w-2.5 h-2.5 text-amber-400" />
+                        <span>Edit</span>
+                      </button>
+
+                      {char.id !== "dm" && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setCharacterToDelete(char);
+                          }}
+                          className="p-1 hover:bg-red-950/50 text-slate-500 hover:text-red-400 border border-white/5 hover:border-red-500/30 rounded text-[9px] transition-all cursor-pointer"
+                          title={`Remove ${char.name} from party`}
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               );
@@ -842,6 +891,7 @@ export default function App() {
                 onDeleteLocation={handleDeleteLocation}
                 onToggleBossSlain={handleToggleBossSlain}
                 onToggleHidden={handleToggleHidden}
+                onUpdateFog={handleUpdateFog}
               />
             </div>
           )}
@@ -1282,6 +1332,36 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Saved Campaign Pictures Reuse */}
+                {(() => {
+                  const imgs = extractCampaignImages(state);
+                  if (imgs.length === 0) return null;
+                  return (
+                    <div className="space-y-1">
+                      <span className="text-[9px] uppercase font-mono text-emerald-400 font-bold">
+                        Saved Campaign Pictures ({imgs.length}) — Click to reuse
+                      </span>
+                      <div className="flex gap-1.5 overflow-x-auto pb-1">
+                        {imgs.slice(0, 18).map((img, i) => (
+                          <button
+                            key={`char-saved-${i}`}
+                            type="button"
+                            onClick={() => setEditCharAvatarUrl(img.url)}
+                            title={img.label}
+                            className={`w-10 h-10 rounded-lg overflow-hidden border shrink-0 cursor-pointer ${
+                              editCharAvatarUrl === img.url
+                                ? "border-amber-400 ring-2 ring-amber-400/50"
+                                : "border-white/15 hover:border-amber-400"
+                            }`}
+                          >
+                            <img src={img.url} alt={img.label} className="w-full h-full object-cover" />
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+
                 {/* Name, Class & Race */}
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div>
@@ -1455,7 +1535,7 @@ export default function App() {
                   {editingCharacter.id !== "dm" && (
                     <button
                       type="button"
-                      onClick={() => handleDeleteCharacter(editingCharacter.id)}
+                      onClick={() => setCharacterToDelete(editingCharacter)}
                       className="px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-950/40 border border-red-500/30 rounded-lg text-xs font-mono flex items-center gap-1.5 cursor-pointer"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -1485,12 +1565,89 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      {/* Standalone Desktop Executable & Campaign Save Manager Modal */}
+      {/* ========================================================= */}
+      {/* IN-APP CONFIRMATION MODAL: REMOVE PARTY CHARACTER */}
+      {/* ========================================================= */}
+      <AnimatePresence>
+        {characterToDelete && (
+          <div className="fixed inset-0 z-70 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="w-full max-w-sm bg-[#12141e] border border-red-500/40 rounded-2xl p-5 shadow-2xl space-y-4 font-sans text-slate-200"
+            >
+              <div className="flex items-center space-x-3 text-red-400 border-b border-white/10 pb-3">
+                <div className="p-2 bg-red-950/60 rounded-xl border border-red-500/30">
+                  <Trash2 className="w-5 h-5 text-red-400" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white font-mono uppercase tracking-wider">
+                    Remove Party Hero?
+                  </h3>
+                  <span className="text-3xs text-slate-400 font-mono">Party Alliance Update</span>
+                </div>
+              </div>
+
+              <div className="flex items-center space-x-3 bg-black/30 p-3 rounded-xl border border-white/5">
+                <div className="w-10 h-10 rounded-full overflow-hidden border border-white/20 bg-[#1e2029] shrink-0">
+                  {characterToDelete.avatarUrl ? (
+                    <img src={characterToDelete.avatarUrl} alt={characterToDelete.name} className="object-cover w-full h-full" />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-amber-500 font-bold font-serif">
+                      {characterToDelete.name[0]}
+                    </div>
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm font-bold text-white font-serif italic truncate">
+                    {characterToDelete.name}
+                  </div>
+                  <div className="text-3xs text-slate-400 font-mono">
+                    Lvl {characterToDelete.level} {characterToDelete.race} {characterToDelete.className}
+                  </div>
+                </div>
+              </div>
+
+              <p className="text-xs text-slate-300 leading-relaxed font-sans">
+                Are you sure you want to dismiss <strong className="text-white">{characterToDelete.name}</strong> from the party alliance?
+              </p>
+
+              <div className="flex gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setCharacterToDelete(null)}
+                  className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-mono transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleDeleteCharacter(characterToDelete.id)}
+                  className="flex-1 py-2 bg-red-600 hover:bg-red-500 text-white font-mono font-bold text-xs uppercase tracking-wider rounded-lg transition-colors cursor-pointer shadow-lg flex items-center justify-center gap-1.5"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Remove Hero</span>
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Campaign Save Manager (.json) Modal */}
       <StandaloneModal
         isOpen={isStandaloneModalOpen}
         onClose={() => setIsStandaloneModalOpen(false)}
         campaignState={state}
-        onImportCampaign={(newState) => setState(newState)}
+        onImportCampaign={(newState) => {
+          setState(newState);
+          setCampaignNameInput(newState.campaignName || "Aethelgard");
+          setPartyNameInput(newState.partyName || "Campaign Party Alliance");
+          if (newState.characters && newState.characters.length > 0) {
+            setSelectedCharacterId(newState.characters[0].id);
+          }
+        }}
       />
 
     </div>

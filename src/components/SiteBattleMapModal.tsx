@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { CampaignLocation, SiteBattleMap, MapToken, Character, LocationType } from "../types";
+import { CampaignLocation, SiteBattleMap, MapToken, Character, LocationType, FogOfWarState } from "../types";
 import { 
   X, 
   Upload, 
@@ -24,16 +24,35 @@ import {
   FolderPlus,
   Heart,
   Navigation,
-  Skull
+  Skull,
+  Cloud,
+  CloudOff,
+  Eraser,
+  Undo2
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import FogOfWarOverlay from "./FogOfWarOverlay";
+import { isPointVisibleToPlayers } from "../utils/fogOfWar";
+import { ExtractedCampaignImage, processUploadedImage } from "../utils/imageUtils";
 
 interface SiteBattleMapModalProps {
   location: CampaignLocation;
+  buildingId?: string;
   characters: Character[];
   partyLocationId: string;
+  isDmMode?: boolean;
+  onToggleDmMode?: () => void;
+  savedImages?: ExtractedCampaignImage[];
   onClose: () => void;
-  onSaveBattleMaps: (locationId: string, interiorMaps: SiteBattleMap[], activeInteriorMapId: string) => Promise<void>;
+  onSaveBattleMaps: (locationId: string, interiorMaps: SiteBattleMap[], activeInteriorMapId: string, buildingId?: string) => Promise<void>;
+  onUpdateFog?: (payload: {
+    targetType: "region" | "city" | "building" | "battlemap";
+    regionId?: string;
+    locationId?: string;
+    buildingId?: string;
+    mapId?: string;
+    fogOfWar: FogOfWarState;
+  }) => Promise<void>;
 }
 
 // Preset Curated High-Resolution Battle Map Textures
@@ -90,10 +109,15 @@ const BATTLEMAP_PRESETS = [
 
 export default function SiteBattleMapModal({
   location,
+  buildingId,
   characters,
   partyLocationId,
+  isDmMode: externalDmMode,
+  onToggleDmMode,
+  savedImages = [],
   onClose,
-  onSaveBattleMaps
+  onSaveBattleMaps,
+  onUpdateFog
 }: SiteBattleMapModalProps) {
   // Determine initial maps or create default
   const getDefaultMap = (): SiteBattleMap => {
@@ -159,11 +183,34 @@ export default function SiteBattleMapModal({
   const [newMapRows, setNewMapRows] = useState(10);
   const [newMapPresetId, setNewMapPresetId] = useState("cavern");
 
-  // Zoom scale
+  // Zoom scale (supports 25% up to 350% for up to 100x100 grids)
   const [zoom, setZoom] = useState(1);
+  const [hoverCell, setHoverCell] = useState<{ x: number; y: number } | null>(null);
+  const gridContainerRef = useRef<HTMLDivElement>(null);
 
   // Battle Map Fit Mode (Contain vs Cover)
   const [battleMapFitMode, setBattleMapFitMode] = useState<"contain" | "cover">("contain");
+
+  // DM Mode vs Player View + Fog of War Controls
+  const [localDmMode, setLocalDmMode] = useState<boolean>(externalDmMode ?? true);
+  useEffect(() => {
+    if (externalDmMode !== undefined) {
+      setLocalDmMode(externalDmMode);
+    }
+  }, [externalDmMode]);
+  const effectiveDmMode = externalDmMode !== undefined ? externalDmMode : localDmMode;
+  const handleSwitchDmMode = () => {
+    if (onToggleDmMode) {
+      onToggleDmMode();
+    } else {
+      setLocalDmMode((p) => !p);
+    }
+  };
+
+  const [isFogToolbarOpen, setIsFogToolbarOpen] = useState<boolean>(false);
+  const [fogBrushMode, setFogBrushMode] = useState<"off" | "reveal" | "hide">("off");
+  const [fogBrushRadius, setFogBrushRadius] = useState<number>(12);
+  const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState<boolean>(false);
 
   // Custom Monster Spawner Modal state
   const [isCustomMonsterModalOpen, setIsCustomMonsterModalOpen] = useState(false);
@@ -186,7 +233,42 @@ export default function SiteBattleMapModal({
   // Sync edits to parent and server
   const saveChanges = async (updatedMaps: SiteBattleMap[], targetMapId = activeMapId) => {
     setInteriorMaps(updatedMaps);
-    await onSaveBattleMaps(location.id, updatedMaps, targetMapId);
+    await onSaveBattleMaps(location.id, updatedMaps, targetMapId, buildingId);
+  };
+
+  // Update Fog of War on active battle map
+  const handleUpdateBattleFog = async (nextFog: FogOfWarState) => {
+    const updatedMaps = interiorMaps.map((m) =>
+      m.id === activeMap.id ? { ...m, fogOfWar: nextFog } : m
+    );
+    await saveChanges(updatedMaps, activeMap.id);
+  };
+
+  const handleToggleBattleFogOrOpen = async () => {
+    if (!activeMap.fogOfWar?.enabled) {
+      await handleUpdateBattleFog({
+        enabled: true,
+        strokes: activeMap.fogOfWar?.strokes || []
+      });
+      setIsFogToolbarOpen(true);
+      setFogBrushMode("reveal");
+    } else {
+      setIsFogToolbarOpen((prev) => {
+        const nextOpen = !prev;
+        if (!nextOpen) setFogBrushMode("off");
+        return nextOpen;
+      });
+    }
+  };
+
+  const gridAspect = activeMap.gridCols / activeMap.gridRows;
+
+  const isCellVisibleToPlayers = (cIdx: number, rIdx: number) => {
+    if (effectiveDmMode) return true;
+    if (!activeMap.fogOfWar?.enabled) return true;
+    const xPct = ((cIdx + 0.5) / activeMap.gridCols) * 100;
+    const yPct = ((rIdx + 0.5) / activeMap.gridRows) * 100;
+    return isPointVisibleToPlayers(activeMap.fogOfWar, xPct, yPct, gridAspect);
   };
 
   // Switch active map
@@ -209,14 +291,16 @@ export default function SiteBattleMapModal({
   const handleAddNewMap = async (e: React.FormEvent) => {
     e.preventDefault();
     const preset = BATTLEMAP_PRESETS.find(p => p.id === newMapPresetId) || BATTLEMAP_PRESETS[0];
+    const safeCols = Math.max(4, Math.min(100, Number(newMapCols) || 14));
+    const safeRows = Math.max(4, Math.min(100, Number(newMapRows) || 10));
     const newMap: SiteBattleMap = {
       id: "map_" + Date.now(),
       locationId: location.id,
       name: newMapName.trim() || `Level ${interiorMaps.length + 1} Chamber`,
       description: `Interior sector of ${location.name}.`,
       imageUrl: preset.url,
-      gridCols: Number(newMapCols) || 14,
-      gridRows: Number(newMapRows) || 10,
+      gridCols: safeCols,
+      gridRows: safeRows,
       showGrid: true,
       gridColor: "rgba(255, 255, 255, 0.18)",
       tokens: []
@@ -229,23 +313,20 @@ export default function SiteBattleMapModal({
     await saveChanges(updated, newMap.id);
   };
 
-  // Delete current interior map
+  // Delete or reset current interior map (in-app confirm, no window.confirm)
   const handleDeleteCurrentMap = async () => {
+    setIsDeleteConfirmOpen(false);
     if (interiorMaps.length <= 1) {
-      if (window.confirm("Reset this interior map to a blank template?")) {
-        const fresh = [getDefaultMap()];
-        setActiveMapId(fresh[0].id);
-        await saveChanges(fresh, fresh[0].id);
-      }
+      const fresh = [getDefaultMap()];
+      setActiveMapId(fresh[0].id);
+      await saveChanges(fresh, fresh[0].id);
       return;
     }
 
-    if (window.confirm(`Delete inside map "${activeMap.name}"?`)) {
-      const updated = interiorMaps.filter(m => m.id !== activeMap.id);
-      const nextActiveId = updated[0].id;
-      setActiveMapId(nextActiveId);
-      await saveChanges(updated, nextActiveId);
-    }
+    const updated = interiorMaps.filter(m => m.id !== activeMap.id);
+    const nextActiveId = updated[0].id;
+    setActiveMapId(nextActiveId);
+    await saveChanges(updated, nextActiveId);
   };
 
   // Save map settings
@@ -253,12 +334,21 @@ export default function SiteBattleMapModal({
     e.preventDefault();
     const updated = interiorMaps.map(m => {
       if (m.id === activeMap.id) {
+        const nextCols = Math.max(4, Math.min(100, Number(editCols) || 12));
+        const nextRows = Math.max(4, Math.min(100, Number(editRows) || 10));
+        // Clamp existing tokens so none end up outside reduced grid bounds
+        const clampedTokens = m.tokens.map(t => ({
+          ...t,
+          x: Math.min(nextCols - 1, Math.max(0, t.x)),
+          y: Math.min(nextRows - 1, Math.max(0, t.y))
+        }));
         return {
           ...m,
           name: editName.trim() || m.name,
-          gridCols: Math.max(6, Math.min(30, Number(editCols) || 12)),
-          gridRows: Math.max(6, Math.min(30, Number(editRows) || 10)),
-          showGrid: editShowGrid
+          gridCols: nextCols,
+          gridRows: nextRows,
+          showGrid: editShowGrid,
+          tokens: clampedTokens
         };
       }
       return m;
@@ -281,19 +371,18 @@ export default function SiteBattleMapModal({
     await saveChanges(updated);
   };
 
-  // Handle Local File Upload
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Handle Local File Upload (auto-optimizes large images for fast JSON save/load)
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      const dataUrl = event.target?.result as string;
+    try {
+      const dataUrl = await processUploadedImage(file);
       if (dataUrl) {
         await handleApplyImage(dataUrl);
       }
-    };
-    reader.readAsDataURL(file);
+    } catch (err) {
+      console.error("Failed to process battle map upload:", err);
+    }
   };
 
   // Click on a Grid Cell (handles placement, token movement, ruler)
@@ -424,17 +513,17 @@ export default function SiteBattleMapModal({
   };
 
   // Handle Monster Token Picture File Upload
-  const handleMonsterFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleMonsterFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
+    try {
+      const dataUrl = await processUploadedImage(file);
       if (dataUrl) {
         setCustomMonsterImageUrl(dataUrl);
       }
-    };
-    reader.readAsDataURL(file);
+    } catch (err) {
+      console.error("Monster image upload error:", err);
+    }
   };
 
   // Spawn Custom Monster Token onto battle grid
@@ -497,7 +586,10 @@ export default function SiteBattleMapModal({
     return cells * 5;
   };
 
-  const selectedToken = activeMap.tokens.find(t => t.id === selectedTokenId);
+  const rawSelectedToken = activeMap.tokens.find(t => t.id === selectedTokenId);
+  const selectedToken = rawSelectedToken && (effectiveDmMode || rawSelectedToken.type === "player" || isCellVisibleToPlayers(rawSelectedToken.x, rawSelectedToken.y))
+    ? rawSelectedToken
+    : undefined;
 
   return (
     <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex flex-col p-2 md:p-5 text-slate-200 overflow-hidden font-sans select-none animate-in fade-in duration-200">
@@ -571,12 +663,41 @@ export default function SiteBattleMapModal({
           </button>
         </div>
 
-        {/* Right: Map Actions (Fit Mode, Import Image, Settings, Delete, Close) */}
-        <div className="flex items-center space-x-2">
+        {/* Right: Map Actions (DM/Player Toggle, Fog of War, Fit Mode, Import Image, Settings, Delete, Close) */}
+        <div className="flex items-center flex-wrap gap-1.5 sm:gap-2">
+          {/* DM View / Player View Toggle */}
+          <button
+            onClick={handleSwitchDmMode}
+            className={`px-2.5 py-1.5 rounded-lg text-2xs font-mono font-bold transition-all cursor-pointer flex items-center gap-1 border ${
+              effectiveDmMode
+                ? "bg-amber-500 text-black border-amber-300"
+                : "bg-blue-600 text-white border-blue-400"
+            }`}
+            title="Switch between DM Mode (manage fog & see all tokens) and Player View"
+          >
+            <span>{effectiveDmMode ? "🎭 DM View" : "🛡️ Player View"}</span>
+          </button>
+
+          {/* Fog of War DM Button */}
+          {effectiveDmMode && (
+            <button
+              onClick={handleToggleBattleFogOrOpen}
+              className={`px-2.5 py-1.5 rounded-lg text-2xs uppercase font-mono font-bold transition-all flex items-center space-x-1.5 cursor-pointer border ${
+                activeMap.fogOfWar?.enabled
+                  ? "bg-purple-600/30 text-purple-200 border-purple-400/60 shadow"
+                  : "bg-[#1a1c28] text-slate-300 border-white/10 hover:text-white"
+              }`}
+              title="Manage Fog of War on this battle map"
+            >
+              <Cloud className="w-3.5 h-3.5 text-purple-400" />
+              <span>{activeMap.fogOfWar?.enabled ? "☁️ Fog: ON" : "☁️ Fog of War"}</span>
+            </button>
+          )}
+
           {/* Fit Map Picture Toggle (No Crop) */}
           <button
             onClick={() => setBattleMapFitMode(m => m === "contain" ? "cover" : "contain")}
-            className={`px-3 py-1.5 rounded-lg text-2xs uppercase font-mono font-bold transition-all flex items-center space-x-1.5 cursor-pointer border ${
+            className={`px-2.5 py-1.5 rounded-lg text-2xs uppercase font-mono font-bold transition-all flex items-center space-x-1.5 cursor-pointer border ${
               battleMapFitMode === "contain"
                 ? "bg-amber-500/20 text-amber-300 border-amber-500/40"
                 : "bg-[#1a1c28] text-slate-300 border-white/10 hover:text-white"
@@ -584,17 +705,17 @@ export default function SiteBattleMapModal({
             title="Toggle between showing entire uncropped map picture vs filling grid"
           >
             <ImageIcon className="w-3.5 h-3.5 text-amber-500" />
-            <span>{battleMapFitMode === "contain" ? "🖼️ Uncropped Fit" : "↔️ Fill Grid"}</span>
+            <span className="hidden sm:inline">{battleMapFitMode === "contain" ? "🖼️ Uncropped Fit" : "↔️ Fill Grid"}</span>
           </button>
 
           {/* Import / Change Image button */}
           <button
             onClick={() => setIsImageImporterOpen(true)}
-            className="px-3 py-1.5 bg-[#1a1c28] hover:bg-amber-500/20 text-slate-200 hover:text-amber-300 border border-white/10 hover:border-amber-500/40 rounded-lg text-2xs uppercase font-mono font-bold transition-all flex items-center space-x-1.5 cursor-pointer shadow-sm"
+            className="px-2.5 py-1.5 bg-[#1a1c28] hover:bg-amber-500/20 text-slate-200 hover:text-amber-300 border border-white/10 hover:border-amber-500/40 rounded-lg text-2xs uppercase font-mono font-bold transition-all flex items-center space-x-1.5 cursor-pointer shadow-sm"
             title="Import custom image/picture as the battle map of this site"
           >
             <Upload className="w-3.5 h-3.5 text-amber-500" />
-            <span>Import Image</span>
+            <span className="hidden sm:inline">Import Image</span>
           </button>
 
           {/* Map Settings button */}
@@ -614,7 +735,7 @@ export default function SiteBattleMapModal({
 
           {/* Delete current inside map */}
           <button
-            onClick={handleDeleteCurrentMap}
+            onClick={() => setIsDeleteConfirmOpen(true)}
             className="p-1.5 bg-red-950/40 hover:bg-red-900/60 text-red-400 border border-red-500/30 rounded-lg transition-all cursor-pointer"
             title="Remove/Delete this inside battle map"
           >
@@ -634,6 +755,103 @@ export default function SiteBattleMapModal({
         </div>
 
       </div>
+
+      {/* DM FOG OF WAR MANAGEMENT BAR FOR BATTLE MAP */}
+      {effectiveDmMode && isFogToolbarOpen && (
+        <div className="bg-[#151224] border border-purple-500/40 rounded-xl px-4 py-2 mb-3 flex flex-wrap items-center justify-between gap-2 text-xs font-mono shadow-lg shrink-0">
+          <div className="flex items-center flex-wrap gap-2">
+            <span className="text-purple-300 font-bold flex items-center gap-1">
+              <Cloud className="w-4 h-4 text-purple-400" />
+              <span>Fog of War:</span>
+            </span>
+
+            <button
+              onClick={() => setFogBrushMode(fogBrushMode === "reveal" ? "off" : "reveal")}
+              className={`px-2.5 py-1 rounded-lg border font-bold flex items-center gap-1 cursor-pointer transition-all ${
+                fogBrushMode === "reveal"
+                  ? "bg-amber-500 text-black border-amber-300 shadow"
+                  : "bg-white/5 hover:bg-white/10 text-slate-200 border-white/15"
+              }`}
+              title="Click and drag over battle grid to reveal rooms to players"
+            >
+              <Eraser className="w-3.5 h-3.5" />
+              <span>Clear Fog (Reveal)</span>
+            </button>
+
+            <button
+              onClick={() => setFogBrushMode(fogBrushMode === "hide" ? "off" : "hide")}
+              className={`px-2.5 py-1 rounded-lg border font-bold flex items-center gap-1 cursor-pointer transition-all ${
+                fogBrushMode === "hide"
+                  ? "bg-purple-500 text-white border-purple-300 shadow"
+                  : "bg-white/5 hover:bg-white/10 text-slate-200 border-white/15"
+              }`}
+              title="Click and drag to paint fog back over areas"
+            >
+              <Cloud className="w-3.5 h-3.5" />
+              <span>Add Fog (Cover)</span>
+            </button>
+
+            <div className="flex items-center bg-black/40 border border-white/10 rounded-lg p-0.5">
+              {[{ label: "S", r: 7 }, { label: "M", r: 14 }, { label: "L", r: 24 }].map((sz) => (
+                <button
+                  key={sz.label}
+                  onClick={() => setFogBrushRadius(sz.r)}
+                  className={`px-2 py-0.5 rounded text-2xs font-bold cursor-pointer ${
+                    fogBrushRadius === sz.r ? "bg-purple-500 text-white" : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  {sz.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex items-center flex-wrap gap-1.5">
+            <button
+              onClick={() => {
+                const strokes = activeMap.fogOfWar?.strokes || [];
+                if (strokes.length > 0) {
+                  handleUpdateBattleFog({ enabled: true, strokes: strokes.slice(0, -1) });
+                }
+              }}
+              disabled={!activeMap.fogOfWar?.strokes?.length}
+              className="px-2 py-1 bg-white/5 hover:bg-white/10 disabled:opacity-40 text-slate-200 rounded-lg border border-white/10 flex items-center gap-1 cursor-pointer"
+            >
+              <Undo2 className="w-3 h-3" />
+              <span>Undo</span>
+            </button>
+            <button
+              onClick={() => handleUpdateBattleFog({ enabled: true, strokes: [] })}
+              className="px-2 py-1 bg-purple-950/60 hover:bg-purple-900/70 text-purple-200 rounded-lg border border-purple-500/30 cursor-pointer"
+            >
+              Cover All
+            </button>
+            <button
+              onClick={() => handleUpdateBattleFog({ enabled: true, strokes: [{ x: 50, y: 50, r: 150, mode: "reveal" }] })}
+              className="px-2 py-1 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 rounded-lg border border-amber-500/30 cursor-pointer"
+            >
+              Reveal All
+            </button>
+            <button
+              onClick={() => {
+                handleUpdateBattleFog({ enabled: false, strokes: activeMap.fogOfWar?.strokes || [] });
+                setFogBrushMode("off");
+                setIsFogToolbarOpen(false);
+              }}
+              className="px-2 py-1 bg-red-950/50 hover:bg-red-900/60 text-red-300 rounded-lg border border-red-500/30 flex items-center gap-1 cursor-pointer"
+            >
+              <CloudOff className="w-3 h-3" />
+              <span>Turn Off Fog</span>
+            </button>
+            <button
+              onClick={() => { setFogBrushMode("off"); setIsFogToolbarOpen(false); }}
+              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg cursor-pointer"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* MAIN BATTLE MAP VIEWPORT & SIDE PANELS */}
       <div className="flex-1 flex flex-col lg:flex-row gap-3 min-h-0 overflow-hidden relative">
@@ -695,21 +913,21 @@ export default function SiteBattleMapModal({
               <Grid className="w-3.5 h-3.5" />
             </button>
 
-            {/* Zoom Controls */}
+            {/* Zoom Controls (25% - 350%) */}
             <div className="flex items-center space-x-1 border-l border-white/10 pl-2">
               <button
-                onClick={() => setZoom(z => Math.max(0.7, z - 0.15))}
-                className="p-1 hover:bg-white/10 text-slate-400 hover:text-white rounded"
+                onClick={() => setZoom(z => Math.max(0.25, parseFloat((z - 0.15).toFixed(2))))}
+                className="p-1 hover:bg-white/10 text-slate-400 hover:text-white rounded cursor-pointer"
                 title="Zoom Out"
               >
                 <ZoomOut className="w-3 h-3" />
               </button>
-              <span className="text-3xs font-mono text-slate-400 w-8 text-center">
+              <span className="text-3xs font-mono text-slate-400 w-9 text-center">
                 {Math.round(zoom * 100)}%
               </span>
               <button
-                onClick={() => setZoom(z => Math.min(2.0, z + 0.15))}
-                className="p-1 hover:bg-white/10 text-slate-400 hover:text-white rounded"
+                onClick={() => setZoom(z => Math.min(3.5, parseFloat((z + 0.15).toFixed(2))))}
+                className="p-1 hover:bg-white/10 text-slate-400 hover:text-white rounded cursor-pointer"
                 title="Zoom In"
               >
                 <ZoomIn className="w-3 h-3" />
@@ -757,129 +975,202 @@ export default function SiteBattleMapModal({
 
           {/* SCROLLABLE MAP & TACTICAL GRID AREA */}
           <div className="flex-1 overflow-auto p-4 flex items-center justify-center custom-scrollbar">
-            <div
-              style={{
-                transform: `scale(${zoom})`,
-                transformOrigin: "center center",
-                transition: "transform 0.15s ease-out"
-              }}
-              className="relative shadow-2xl rounded-xl overflow-hidden border border-white/20 shrink-0"
-            >
-              {/* Battle Map Background Image */}
-              <div
-                style={{
-                  backgroundImage: `url(${activeMap.imageUrl})`,
-                  backgroundSize: battleMapFitMode === "contain" ? "contain" : "cover",
-                  backgroundRepeat: "no-repeat",
-                  backgroundPosition: "center",
-                  backgroundColor: "#07080c",
-                  width: `${activeMap.gridCols * 56}px`,
-                  height: `${activeMap.gridRows * 56}px`
-                }}
-                className="relative"
-              >
-                {/* Vignette / ambient battle lighting */}
-                <div className="absolute inset-0 bg-black/25 pointer-events-none" />
+            {(() => {
+              const maxDim = Math.max(activeMap.gridCols, activeMap.gridRows);
+              const cellPx = maxDim <= 20 ? 56 : Math.max(16, Math.floor(1120 / maxDim));
+              const boardWidth = activeMap.gridCols * cellPx;
+              const boardHeight = activeMap.gridRows * cellPx;
+              const gridLineColor = activeMap.gridColor || "rgba(255, 255, 255, 0.18)";
+              const tokenPx = Math.max(12, Math.round(cellPx * 0.72));
 
-                {/* Tactical Grid Overlay Cells */}
+              const getGridCoordsFromPointer = (clientX: number, clientY: number) => {
+                const el = gridContainerRef.current;
+                if (!el) return null;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return null;
+                const cIdx = Math.max(0, Math.min(activeMap.gridCols - 1, Math.floor(((clientX - rect.left) / rect.width) * activeMap.gridCols)));
+                const rIdx = Math.max(0, Math.min(activeMap.gridRows - 1, Math.floor(((clientY - rect.top) / rect.height) * activeMap.gridRows)));
+                return { x: cIdx, y: rIdx };
+              };
+
+              return (
                 <div
                   style={{
-                    display: "grid",
-                    gridTemplateColumns: `repeat(${activeMap.gridCols}, 56px)`,
-                    gridTemplateRows: `repeat(${activeMap.gridRows}, 56px)`
+                    transform: `scale(${zoom})`,
+                    transformOrigin: "center center",
+                    transition: "transform 0.15s ease-out"
                   }}
-                  className="absolute inset-0 z-10"
+                  className="relative shadow-2xl rounded-xl overflow-hidden border border-white/20 shrink-0"
                 >
-                  {Array.from({ length: activeMap.gridRows }).map((_, rIdx) =>
-                    Array.from({ length: activeMap.gridCols }).map((_, cIdx) => {
-                      const tokenHere = activeMap.tokens.find(t => t.x === cIdx && t.y === rIdx);
-                      const isSelectedCell = selectedToken && selectedToken.x === cIdx && selectedToken.y === rIdx;
-                      const isRulerPoint = (rulerStart?.x === cIdx && rulerStart?.y === rIdx) || (rulerEnd?.x === cIdx && rulerEnd?.y === rIdx);
+                  {/* Battle Map Background Image */}
+                  <div
+                    ref={gridContainerRef}
+                    onClick={(e) => {
+                      const coords = getGridCoordsFromPointer(e.clientX, e.clientY);
+                      if (coords) handleCellClick(coords.x, coords.y);
+                    }}
+                    onMouseMove={(e) => {
+                      const coords = getGridCoordsFromPointer(e.clientX, e.clientY);
+                      setHoverCell(coords);
+                    }}
+                    onMouseLeave={() => setHoverCell(null)}
+                    style={{
+                      backgroundImage: `url(${activeMap.imageUrl})`,
+                      backgroundSize: battleMapFitMode === "contain" ? "contain" : "cover",
+                      backgroundRepeat: "no-repeat",
+                      backgroundPosition: "center",
+                      backgroundColor: "#07080c",
+                      width: `${boardWidth}px`,
+                      height: `${boardHeight}px`
+                    }}
+                    className="relative cursor-pointer"
+                  >
+                    {/* Vignette / ambient battle lighting */}
+                    <div className="absolute inset-0 bg-black/20 pointer-events-none" />
+
+                    {/* High-Performance CSS Grid Lines (Supports up to 100x100 cleanly) */}
+                    {activeMap.showGrid && (
+                      <div
+                        className="absolute inset-0 z-10 pointer-events-none"
+                        style={{
+                          backgroundImage: `linear-gradient(to right, ${gridLineColor} 1px, transparent 1px), linear-gradient(to bottom, ${gridLineColor} 1px, transparent 1px)`,
+                          backgroundSize: `${cellPx}px ${cellPx}px`
+                        }}
+                      />
+                    )}
+
+                    {/* Hover Cell Highlight */}
+                    {hoverCell && (
+                      <div
+                        style={{
+                          left: `${(hoverCell.x / activeMap.gridCols) * 100}%`,
+                          top: `${(hoverCell.y / activeMap.gridRows) * 100}%`,
+                          width: `${100 / activeMap.gridCols}%`,
+                          height: `${100 / activeMap.gridRows}%`
+                        }}
+                        className="absolute z-10 bg-amber-500/15 pointer-events-none"
+                      />
+                    )}
+
+                    {/* Selected Token Cell Highlight */}
+                    {selectedToken && (
+                      <div
+                        style={{
+                          left: `${(selectedToken.x / activeMap.gridCols) * 100}%`,
+                          top: `${(selectedToken.y / activeMap.gridRows) * 100}%`,
+                          width: `${100 / activeMap.gridCols}%`,
+                          height: `${100 / activeMap.gridRows}%`
+                        }}
+                        className="absolute z-10 bg-amber-500/25 ring-2 ring-amber-400 ring-inset pointer-events-none"
+                      />
+                    )}
+
+                    {/* Ruler Point Highlights */}
+                    {[rulerStart, rulerEnd].map((pt, idx) =>
+                      pt ? (
+                        <div
+                          key={`ruler-pt-${idx}`}
+                          style={{
+                            left: `${(pt.x / activeMap.gridCols) * 100}%`,
+                            top: `${(pt.y / activeMap.gridRows) * 100}%`,
+                            width: `${100 / activeMap.gridCols}%`,
+                            height: `${100 / activeMap.gridRows}%`
+                          }}
+                          className="absolute z-10 bg-cyan-500/30 ring-2 ring-cyan-400 ring-inset pointer-events-none"
+                        />
+                      ) : null
+                    )}
+
+                    {/* Deployed Tokens Layer */}
+                    {activeMap.tokens.map((tokenHere) => {
+                      const cellVisibleToPlayers = isCellVisibleToPlayers(tokenHere.x, tokenHere.y);
+                      const shouldShowToken = effectiveDmMode || tokenHere.type === "player" || cellVisibleToPlayers;
+                      if (!shouldShowToken) return null;
 
                       return (
                         <div
-                          key={`cell-${cIdx}-${rIdx}`}
-                          onClick={() => handleCellClick(cIdx, rIdx)}
+                          key={tokenHere.id}
                           style={{
-                            borderColor: activeMap.showGrid ? (activeMap.gridColor || "rgba(255, 255, 255, 0.18)") : "transparent"
+                            left: `${((tokenHere.x + 0.5) / activeMap.gridCols) * 100}%`,
+                            top: `${((tokenHere.y + 0.5) / activeMap.gridRows) * 100}%`,
+                            transform: "translate(-50%, -50%)"
                           }}
-                          className={`relative border flex items-center justify-center transition-colors cursor-pointer ${
-                            isSelectedCell
-                              ? "bg-amber-500/25 ring-2 ring-amber-400 ring-inset"
-                              : isRulerPoint
-                              ? "bg-cyan-500/30 ring-2 ring-cyan-400 ring-inset"
-                              : "hover:bg-amber-500/15"
-                          }`}
-                          title={`Square (${cIdx + 1}, ${rIdx + 1})`}
+                          className="absolute z-20 flex flex-col items-center pointer-events-none"
+                          title={`${tokenHere.name} (${tokenHere.x + 1}, ${tokenHere.y + 1})`}
                         >
-                          {/* Token in this grid cell */}
-                          {tokenHere && (
-                            <div className="relative group/token z-20 flex flex-col items-center">
-                              {/* Avatar circle */}
+                          <div
+                            style={{ width: `${tokenPx}px`, height: `${tokenPx}px` }}
+                            className={`rounded-full border-2 overflow-hidden flex items-center justify-center font-bold text-[10px] shadow-xl transition-transform ${
+                              tokenHere.type === "player"
+                                ? "border-amber-400 bg-amber-950 text-amber-200 ring-2 ring-amber-500/40"
+                                : "border-red-400 bg-red-950 text-red-200 ring-2 ring-red-500/40"
+                            } ${selectedTokenId === tokenHere.id ? "scale-115 ring-4 ring-amber-300 animate-pulse" : ""}`}
+                          >
+                            {tokenHere.avatarUrl ? (
+                              <img src={tokenHere.avatarUrl} alt={tokenHere.name} className="w-full h-full object-cover" />
+                            ) : (
+                              tokenHere.name[0]
+                            )}
+                          </div>
+
+                          {tokenHere.hp && cellPx >= 28 && (
+                            <div className="w-7 h-1 bg-black/60 rounded-full overflow-hidden mt-0.5 border border-white/20">
                               <div
-                                className={`w-10 h-10 rounded-full border-2 overflow-hidden flex items-center justify-center font-bold text-xs shadow-xl transition-transform ${
-                                  tokenHere.type === "player"
-                                    ? "border-amber-400 bg-amber-950 text-amber-200 ring-2 ring-amber-500/40"
-                                    : "border-red-400 bg-red-950 text-red-200 ring-2 ring-red-500/40"
-                                } ${selectedTokenId === tokenHere.id ? "scale-115 ring-4 ring-amber-300 animate-pulse" : "hover:scale-105"}`}
-                              >
-                                {tokenHere.avatarUrl ? (
-                                  <img src={tokenHere.avatarUrl} alt={tokenHere.name} className="w-full h-full object-cover" />
-                                ) : (
-                                  tokenHere.name[0]
-                                )}
-                              </div>
-
-                              {/* Tiny HP indicator bar */}
-                              {tokenHere.hp && (
-                                <div className="w-8 h-1 bg-black/60 rounded-full overflow-hidden mt-0.5 border border-white/20">
-                                  <div
-                                    style={{ width: `${Math.min(100, Math.floor((tokenHere.hp.current / tokenHere.hp.max) * 100))}%` }}
-                                    className={`h-full ${
-                                      tokenHere.hp.current / tokenHere.hp.max > 0.5
-                                        ? "bg-emerald-400"
-                                        : tokenHere.hp.current / tokenHere.hp.max > 0.2
-                                        ? "bg-amber-400"
-                                        : "bg-red-500"
-                                    }`}
-                                  />
-                                </div>
-                              )}
-
-                              {/* Name label tag */}
-                              <span className="text-[8px] font-mono font-bold px-1 rounded bg-black/80 text-slate-100 whitespace-nowrap mt-0.5 max-w-[50px] truncate shadow">
-                                {tokenHere.name.split(" ")[0]}
-                              </span>
+                                style={{ width: `${Math.min(100, Math.floor((tokenHere.hp.current / tokenHere.hp.max) * 100))}%` }}
+                                className={`h-full ${
+                                  tokenHere.hp.current / tokenHere.hp.max > 0.5
+                                    ? "bg-emerald-400"
+                                    : tokenHere.hp.current / tokenHere.hp.max > 0.2
+                                    ? "bg-amber-400"
+                                    : "bg-red-500"
+                                }`}
+                              />
                             </div>
                           )}
 
-                          {/* Coordinates watermark */}
-                          <span className="absolute bottom-0.5 right-0.5 text-[6px] font-mono text-white/10 pointer-events-none select-none">
-                            {cIdx},{rIdx}
-                          </span>
+                          {cellPx >= 24 && (
+                            <span className="text-[8px] font-mono font-bold px-1 rounded bg-black/85 text-slate-100 whitespace-nowrap mt-0.5 max-w-[54px] truncate shadow">
+                              {tokenHere.name.split(" ")[0]}
+                            </span>
+                          )}
                         </div>
                       );
-                    })
-                  )}
-                </div>
+                    })}
 
-                {/* Ruler SVG vector line if measurement is active */}
-                {rulerStart && rulerEnd && (
-                  <svg className="absolute inset-0 w-full h-full pointer-events-none z-20">
-                    <line
-                      x1={rulerStart.x * 56 + 28}
-                      y1={rulerStart.y * 56 + 28}
-                      x2={rulerEnd.x * 56 + 28}
-                      y2={rulerEnd.y * 56 + 28}
-                      stroke="#06b6d4"
-                      strokeWidth="3.5"
-                      strokeDasharray="6,4"
+                    {/* Ruler SVG vector line (Resolution-independent for 4x4 to 100x100) */}
+                    {rulerStart && rulerEnd && (
+                      <svg
+                        viewBox={`0 0 ${activeMap.gridCols} ${activeMap.gridRows}`}
+                        preserveAspectRatio="none"
+                        className="absolute inset-0 w-full h-full pointer-events-none z-20"
+                      >
+                        <line
+                          x1={rulerStart.x + 0.5}
+                          y1={rulerStart.y + 0.5}
+                          x2={rulerEnd.x + 0.5}
+                          y2={rulerEnd.y + 0.5}
+                          stroke="#06b6d4"
+                          strokeWidth={Math.max(0.08, Math.min(0.25, maxDim * 0.004))}
+                          strokeDasharray="0.25,0.18"
+                        />
+                      </svg>
+                    )}
+
+                    {/* Battle Map Fog of War Overlay */}
+                    <FogOfWarOverlay
+                      fogOfWar={activeMap.fogOfWar}
+                      aspect={gridAspect}
+                      isDmMode={effectiveDmMode}
+                      brushMode={fogBrushMode}
+                      brushRadius={fogBrushRadius}
+                      onUpdateFog={handleUpdateBattleFog}
+                      zIndexClass="z-[25]"
                     />
-                  </svg>
-                )}
 
-              </div>
-            </div>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
 
           {/* BOTTOM TRAY: PARTY CHARACTERS & COMBAT SPAWN DECK */}
@@ -1085,15 +1376,17 @@ export default function SiteBattleMapModal({
             {/* Tokens Roster Summary List */}
             <div className="space-y-1.5">
               <span className="text-3xs font-mono uppercase text-slate-500 font-bold block">
-                Deployed Combatants ({activeMap.tokens.length}):
+                Deployed Combatants ({activeMap.tokens.filter(t => effectiveDmMode || t.type === "player" || isCellVisibleToPlayers(t.x, t.y)).length}):
               </span>
               <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
-                {activeMap.tokens.length === 0 ? (
+                {activeMap.tokens.filter(t => effectiveDmMode || t.type === "player" || isCellVisibleToPlayers(t.x, t.y)).length === 0 ? (
                   <p className="text-3xs text-slate-600 font-mono italic">
                     Grid clear. Deploy characters or spawn adversaries below.
                   </p>
                 ) : (
-                  activeMap.tokens.map(token => (
+                  activeMap.tokens
+                    .filter(t => effectiveDmMode || t.type === "player" || isCellVisibleToPlayers(t.x, t.y))
+                    .map(token => (
                     <div
                       key={token.id}
                       onClick={() => setSelectedTokenId(token.id)}
@@ -1204,12 +1497,37 @@ export default function SiteBattleMapModal({
                 </div>
               </div>
 
-              {/* Option C: Preset Fantasy Battle Maps Gallery */}
+              {/* Option C: Saved Campaign Pictures (No Re-Upload Needed) */}
+              {savedImages.length > 0 && (
+                <div className="space-y-2 pt-2 border-t border-white/10">
+                  <label className="block text-2xs uppercase font-mono text-emerald-400 font-bold">
+                    Option 3: Saved Campaign Pictures ({savedImages.length} from Save)
+                  </label>
+                  <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 max-h-32 overflow-y-auto pr-1">
+                    {savedImages.map((img, idx) => (
+                      <div
+                        key={`saved-bm-${idx}`}
+                        onClick={() => handleApplyImage(img.url)}
+                        className="group/p relative rounded-lg overflow-hidden border border-emerald-500/30 hover:border-amber-500 cursor-pointer h-16 transition-all shadow"
+                      >
+                        <img src={img.url} alt={img.label} className="w-full h-full object-cover group-hover/p:scale-105 transition-transform" />
+                        <div className="absolute inset-0 bg-black/50 group-hover/p:bg-black/25 transition-colors flex items-end p-1">
+                          <span className="text-[8px] font-mono font-bold text-white leading-tight truncate">
+                            {img.label}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Option D: Preset Fantasy Battle Maps Gallery */}
               <div className="space-y-2 pt-2 border-t border-white/10">
                 <label className="block text-2xs uppercase font-mono text-slate-400 font-bold">
-                  Option 3: Curated Fantasy Preset Textures
+                  Curated Fantasy Preset Textures
                 </label>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-48 overflow-y-auto pr-1">
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-40 overflow-y-auto pr-1">
                   {BATTLEMAP_PRESETS.map(preset => (
                     <div
                       key={preset.id}
@@ -1232,7 +1550,7 @@ export default function SiteBattleMapModal({
         )}
       </AnimatePresence>
 
-      {/* MODAL 2: MAP SETTINGS & GRID DIMENSIONS */}
+      {/* MODAL 2: MAP SETTINGS & GRID DIMENSIONS (Up to 100x100) */}
       <AnimatePresence>
         {isSettingsOpen && (
           <div className="fixed inset-0 z-60 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
@@ -1268,24 +1586,24 @@ export default function SiteBattleMapModal({
 
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-3xs uppercase text-slate-400 mb-1">Grid Columns (Width)</label>
+                    <label className="block text-3xs uppercase text-slate-400 mb-1">Grid Columns (4 – 100)</label>
                     <input
                       type="number"
-                      min={6}
-                      max={30}
+                      min={4}
+                      max={100}
                       value={editCols}
-                      onChange={(e) => setEditCols(parseInt(e.target.value) || 12)}
+                      onChange={(e) => setEditCols(Math.max(4, Math.min(100, parseInt(e.target.value) || 12)))}
                       className="w-full bg-[#161822] border border-white/10 text-amber-400 font-bold px-3 py-1.5 rounded-lg text-xs focus:outline-none focus:border-amber-500"
                     />
                   </div>
                   <div>
-                    <label className="block text-3xs uppercase text-slate-400 mb-1">Grid Rows (Height)</label>
+                    <label className="block text-3xs uppercase text-slate-400 mb-1">Grid Rows (4 – 100)</label>
                     <input
                       type="number"
-                      min={6}
-                      max={30}
+                      min={4}
+                      max={100}
                       value={editRows}
-                      onChange={(e) => setEditRows(parseInt(e.target.value) || 10)}
+                      onChange={(e) => setEditRows(Math.max(4, Math.min(100, parseInt(e.target.value) || 10)))}
                       className="w-full bg-[#161822] border border-white/10 text-amber-400 font-bold px-3 py-1.5 rounded-lg text-xs focus:outline-none focus:border-amber-500"
                     />
                   </div>
@@ -1378,24 +1696,24 @@ export default function SiteBattleMapModal({
 
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-3xs uppercase text-slate-400 mb-1">Grid Columns</label>
+                    <label className="block text-3xs uppercase text-slate-400 mb-1">Grid Columns (4 – 100)</label>
                     <input
                       type="number"
-                      min={6}
-                      max={30}
+                      min={4}
+                      max={100}
                       value={newMapCols}
-                      onChange={(e) => setNewMapCols(parseInt(e.target.value) || 14)}
+                      onChange={(e) => setNewMapCols(Math.max(4, Math.min(100, parseInt(e.target.value) || 14)))}
                       className="w-full bg-[#161822] border border-white/10 text-amber-400 font-bold px-3 py-1.5 rounded-lg text-xs focus:outline-none"
                     />
                   </div>
                   <div>
-                    <label className="block text-3xs uppercase text-slate-400 mb-1">Grid Rows</label>
+                    <label className="block text-3xs uppercase text-slate-400 mb-1">Grid Rows (4 – 100)</label>
                     <input
                       type="number"
-                      min={6}
-                      max={30}
+                      min={4}
+                      max={100}
                       value={newMapRows}
-                      onChange={(e) => setNewMapRows(parseInt(e.target.value) || 10)}
+                      onChange={(e) => setNewMapRows(Math.max(4, Math.min(100, parseInt(e.target.value) || 10)))}
                       className="w-full bg-[#161822] border border-white/10 text-amber-400 font-bold px-3 py-1.5 rounded-lg text-xs focus:outline-none"
                     />
                   </div>
@@ -1627,6 +1945,48 @@ export default function SiteBattleMapModal({
                   </button>
                 </div>
               </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL 5: DELETE / RESET CHAMBER CONFIRMATION (NO window.confirm) */}
+      <AnimatePresence>
+        {isDeleteConfirmOpen && (
+          <div className="fixed inset-0 z-70 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="w-full max-w-sm bg-[#0f1117] border border-red-500/40 rounded-2xl p-5 shadow-2xl space-y-4 font-sans text-slate-200"
+            >
+              <div className="flex items-center space-x-2 text-red-400 border-b border-white/10 pb-2.5">
+                <Trash2 className="w-5 h-5" />
+                <h3 className="text-sm font-bold font-mono uppercase">
+                  {interiorMaps.length <= 1 ? "Reset Chamber Map?" : "Delete Chamber Map?"}
+                </h3>
+              </div>
+              <p className="text-xs text-slate-300 leading-relaxed">
+                {interiorMaps.length <= 1
+                  ? `Reset "${activeMap.name}" back to the default template?`
+                  : `Are you sure you want to permanently delete "${activeMap.name}"?`}
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsDeleteConfirmOpen(false)}
+                  className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-mono cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeleteCurrentMap}
+                  className="flex-1 py-2 bg-red-600 hover:bg-red-500 text-white font-mono font-bold text-xs uppercase rounded-lg cursor-pointer"
+                >
+                  {interiorMaps.length <= 1 ? "Reset" : "Delete"}
+                </button>
+              </div>
             </motion.div>
           </div>
         )}

@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { exec } from "child_process";
+import { CampaignState } from "./src/types";
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
@@ -582,18 +583,77 @@ app.post("/api/campaign/region/image", (req, res) => {
 });
 
 app.get("/api/campaign/export-data", (req, res) => {
-  res.setHeader("Content-Disposition", 'attachment; filename="aethelgard-campaign-save.json"');
-  res.setHeader("Content-Type", "application/json");
-  res.send(JSON.stringify(readCampaignState(), null, 2));
+  try {
+    const campaign = readCampaignState();
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const safeName = (campaign.campaignName || "aethelgard").toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+    const filename = `${safeName}-campaign-save-${timestamp}.json`;
+
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.send(JSON.stringify(campaign, null, 2));
+  } catch (err: any) {
+    console.error("Export error:", err);
+    res.status(500).json({ success: false, error: "Failed to export campaign data" });
+  }
 });
 
 app.post("/api/campaign/import-data", (req, res) => {
-  const { campaign } = req.body;
-  if (!campaign || !Array.isArray(campaign.locations) || !Array.isArray(campaign.characters)) {
-    return res.status(400).json({ error: "Invalid campaign save data format" });
+  try {
+    let payload = req.body;
+    if (typeof payload === "string") {
+      try {
+        payload = JSON.parse(payload);
+      } catch (e) {
+        return res.status(400).json({ success: false, error: "Invalid JSON syntax in uploaded file" });
+      }
+    }
+
+    let imported = payload;
+    if (payload && typeof payload === "object") {
+      if (payload.campaign && typeof payload.campaign === "object") {
+        imported = payload.campaign;
+      } else if (payload.state && typeof payload.state === "object") {
+        imported = payload.state;
+      }
+    }
+
+    if (!imported || typeof imported !== "object") {
+      return res.status(400).json({ success: false, error: "Empty or invalid save file payload." });
+    }
+
+    if (!Array.isArray(imported.locations) && !Array.isArray(imported.characters)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid save file structure. File must contain locations or characters."
+      });
+    }
+
+    const currentState = readCampaignState();
+    const sanitizedCampaign: CampaignState = {
+      ...defaultCampaignState,
+      ...currentState,
+      ...imported,
+      currentRegionId: imported.currentRegionId || currentState.currentRegionId || "sword_coast",
+      partyLocationId: imported.partyLocationId || currentState.partyLocationId || "phandalin",
+      campaignName: imported.campaignName || currentState.campaignName || "Aethelgard",
+      partyName: imported.partyName || currentState.partyName || "Campaign Party Alliance",
+      regions: Array.isArray(imported.regions) && imported.regions.length > 0 ? imported.regions : currentState.regions,
+      locations: Array.isArray(imported.locations) ? imported.locations : currentState.locations,
+      characters: Array.isArray(imported.characters) ? imported.characters : currentState.characters,
+      notes: Array.isArray(imported.notes) ? imported.notes : (currentState.notes || []),
+      recentRolls: Array.isArray(imported.recentRolls) ? imported.recentRolls : (currentState.recentRolls || []),
+      initiativeOrder: Array.isArray(imported.initiativeOrder) ? imported.initiativeOrder : (currentState.initiativeOrder || []),
+      initiativeRound: typeof imported.initiativeRound === "number" ? imported.initiativeRound : 1,
+      currentTurnIndex: typeof imported.currentTurnIndex === "number" ? imported.currentTurnIndex : 0
+    };
+
+    writeCampaignState(sanitizedCampaign);
+    res.json({ success: true, campaign: sanitizedCampaign });
+  } catch (err: any) {
+    console.error("Error importing campaign state:", err);
+    res.status(500).json({ success: false, error: err.message || "Failed to process import data" });
   }
-  writeCampaignState(campaign);
-  res.json({ success: true, campaign });
 });
 
 app.post("/api/campaign/location/create", (req, res) => {

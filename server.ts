@@ -31,8 +31,8 @@ function getHost(): string {
 const PORT = getPort();
 const HOST = getHost();
 
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+app.use(express.json({ limit: "250mb" }));
+app.use(express.urlencoded({ limit: "250mb", extended: true }));
 
 // Healthcheck endpoint for readiness probes
 app.get(["/health", "/api/health"], (_req, res) => {
@@ -664,23 +664,77 @@ app.post("/api/campaign/location/toggle-hidden", (req, res) => {
   res.json({ success: true, location: loc, campaign });
 });
 
-// Update or Modify Site Inside Battle Maps
+// Update or Modify Site Inside Battle Maps (Supports both Location and City Building battle maps)
 app.post("/api/campaign/location/battlemap", (req, res) => {
   const campaign = readCampaignState();
-  const { locationId, interiorMaps, activeInteriorMapId } = req.body;
+  const { locationId, buildingId, interiorMaps, activeInteriorMapId } = req.body;
 
   const loc = campaign.locations.find((l) => l.id === locationId);
   if (!loc) {
     return res.status(404).json({ error: "Location not found" });
   }
 
-  loc.interiorMaps = interiorMaps;
-  if (activeInteriorMapId !== undefined) {
-    loc.activeInteriorMapId = activeInteriorMapId;
+  if (buildingId && Array.isArray(loc.cityBuildings)) {
+    const bld = loc.cityBuildings.find((b) => b.id === buildingId);
+    if (bld) {
+      bld.interiorMaps = interiorMaps;
+    } else {
+      loc.interiorMaps = interiorMaps;
+    }
+  } else {
+    loc.interiorMaps = interiorMaps;
+    if (activeInteriorMapId !== undefined) {
+      loc.activeInteriorMapId = activeInteriorMapId;
+    }
   }
 
   writeCampaignState(campaign);
   res.json({ success: true, location: loc, campaign });
+});
+
+// Update Fog of War for any map level: 'region' | 'city' | 'building' | 'battlemap'
+app.post("/api/campaign/fog", (req, res) => {
+  const campaign = readCampaignState();
+  const { targetType, regionId, locationId, buildingId, mapId, fogOfWar } = req.body;
+
+  if (!targetType || !fogOfWar || typeof fogOfWar.enabled !== "boolean" || !Array.isArray(fogOfWar.strokes)) {
+    return res.status(400).json({ success: false, error: "Invalid Fog of War payload" });
+  }
+
+  if (targetType === "region") {
+    const reg = campaign.regions.find((r) => r.id === regionId);
+    if (!reg) return res.status(404).json({ success: false, error: "Region not found" });
+    reg.fogOfWar = fogOfWar;
+  } else if (targetType === "city") {
+    const loc = campaign.locations.find((l) => l.id === locationId);
+    if (!loc) return res.status(404).json({ success: false, error: "Location not found" });
+    loc.cityFogOfWar = fogOfWar;
+  } else if (targetType === "building") {
+    const loc = campaign.locations.find((l) => l.id === locationId);
+    const bld = loc?.cityBuildings?.find((b) => b.id === buildingId);
+    if (!bld) return res.status(404).json({ success: false, error: "Building not found" });
+    bld.fogOfWar = fogOfWar;
+  } else if (targetType === "battlemap") {
+    const loc = campaign.locations.find((l) => l.id === locationId);
+    if (!loc) return res.status(404).json({ success: false, error: "Location not found" });
+
+    let mapsList = loc.interiorMaps;
+    if (buildingId && Array.isArray(loc.cityBuildings)) {
+      const bld = loc.cityBuildings.find((b) => b.id === buildingId);
+      if (bld && Array.isArray(bld.interiorMaps)) {
+        mapsList = bld.interiorMaps;
+      }
+    }
+
+    const targetMap = mapsList?.find((m) => m.id === mapId);
+    if (!targetMap) return res.status(404).json({ success: false, error: "Battle map not found" });
+    targetMap.fogOfWar = fogOfWar;
+  } else {
+    return res.status(400).json({ success: false, error: "Unsupported Fog of War targetType" });
+  }
+
+  writeCampaignState(campaign);
+  res.json({ success: true, campaign });
 });
 
 // Update Region Background Image (for Big Map & Region Maps)
@@ -703,45 +757,79 @@ app.post("/api/campaign/region/image", (req, res) => {
 
 // Export complete campaign save state as downloadable JSON file
 app.get("/api/campaign/export-data", (req, res) => {
-  const campaign = readCampaignState();
-  res.setHeader("Content-Disposition", 'attachment; filename="aethelgard-campaign-save.json"');
-  res.setHeader("Content-Type", "application/json");
-  res.send(JSON.stringify(campaign, null, 2));
+  try {
+    const campaign = readCampaignState();
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const safeName = (campaign.campaignName || "aethelgard").toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+    const filename = `${safeName}-campaign-save-${timestamp}.json`;
+
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.send(JSON.stringify(campaign, null, 2));
+  } catch (err: any) {
+    console.error("Export error:", err);
+    res.status(500).json({ success: false, error: "Failed to export campaign data" });
+  }
 });
 
-// Import complete campaign save state
+// Import complete campaign save state from JSON
 app.post("/api/campaign/import-data", (req, res) => {
-  const { campaign } = req.body;
-  if (!campaign || !Array.isArray(campaign.locations) || !Array.isArray(campaign.characters)) {
-    return res.status(400).json({ error: "Invalid campaign save data format" });
-  }
-
-  writeCampaignState(campaign);
-  res.json({ success: true, campaign });
-});
-
-// Download Standalone Windows Executable
-app.get("/api/download/standalone-exe", (req, res) => {
-  const exePath = path.join(process.cwd(), "dist", "Aethelgard-Campaign.exe");
-  if (fs.existsSync(exePath)) {
-    res.download(exePath, "Aethelgard-Campaign.exe");
-  } else {
-    res.status(404).send("Standalone executable not yet built. Please run npm run build:exe.");
-  }
-});
-
-// Download Standalone Windows Package (.zip containing exe, save file, and launcher)
-app.get("/api/download/standalone-zip", (req, res) => {
-  const zipPath = path.join(process.cwd(), "dist", "Aethelgard-Standalone-Windows.zip");
-  if (fs.existsSync(zipPath)) {
-    res.download(zipPath, "Aethelgard-Standalone-Windows.zip");
-  } else {
-    const exePath = path.join(process.cwd(), "dist", "Aethelgard-Campaign.exe");
-    if (fs.existsSync(exePath)) {
-      res.download(exePath, "Aethelgard-Campaign.exe");
-    } else {
-      res.status(404).send("Package not yet built. Please run npm run build:exe.");
+  try {
+    let payload = req.body;
+    if (typeof payload === "string") {
+      try {
+        payload = JSON.parse(payload);
+      } catch (e) {
+        return res.status(400).json({ success: false, error: "Invalid JSON syntax in uploaded file" });
+      }
     }
+
+    // Unwrap if wrapped inside { campaign: ... } or { state: ... }
+    let imported = payload;
+    if (payload && typeof payload === "object") {
+      if (payload.campaign && typeof payload.campaign === "object") {
+        imported = payload.campaign;
+      } else if (payload.state && typeof payload.state === "object") {
+        imported = payload.state;
+      }
+    }
+
+    if (!imported || typeof imported !== "object") {
+      return res.status(400).json({ success: false, error: "Empty or invalid save file payload." });
+    }
+
+    if (!Array.isArray(imported.locations) && !Array.isArray(imported.characters)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid save file structure. File must contain locations or characters."
+      });
+    }
+
+    // Sanitize and ensure clean fallback defaults without leaking stale fields from current session
+    const sanitizedCampaign: CampaignState = {
+      ...defaultCampaignState,
+      ...imported,
+      currentRegionId: imported.currentRegionId || defaultCampaignState.currentRegionId,
+      partyLocationId: imported.partyLocationId || defaultCampaignState.partyLocationId,
+      campaignName: imported.campaignName || "Aethelgard",
+      partyName: imported.partyName || "Campaign Party Alliance",
+      regions: Array.isArray(imported.regions) && imported.regions.length > 0 ? imported.regions : defaultCampaignState.regions,
+      locations: Array.isArray(imported.locations) ? imported.locations : defaultCampaignState.locations,
+      characters: Array.isArray(imported.characters) ? imported.characters : defaultCampaignState.characters,
+      notes: Array.isArray(imported.notes) ? imported.notes : [],
+      recentRolls: Array.isArray(imported.recentRolls) ? imported.recentRolls : [],
+      initiativeOrder: Array.isArray(imported.initiativeOrder) ? imported.initiativeOrder : [],
+      initiativeRound: typeof imported.initiativeRound === "number" ? imported.initiativeRound : 1,
+      currentTurnIndex: typeof imported.currentTurnIndex === "number" ? imported.currentTurnIndex : 0,
+      mediaLibrary: Array.isArray(imported.mediaLibrary) ? imported.mediaLibrary : []
+    };
+
+    writeCampaignState(sanitizedCampaign);
+    console.log(`Campaign imported successfully: ${sanitizedCampaign.locations.length} locations, ${sanitizedCampaign.characters.length} characters.`);
+    res.json({ success: true, campaign: sanitizedCampaign });
+  } catch (err: any) {
+    console.error("Error importing campaign state:", err);
+    res.status(500).json({ success: false, error: err.message || "Failed to process import data" });
   }
 });
 
