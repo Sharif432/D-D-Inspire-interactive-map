@@ -18,6 +18,8 @@ export interface Character {
   };
   voice: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
   avatarUrl: string;
+  statusEffects?: string[];
+  exhaustionLevel?: number;
 }
 
 export type LocationType =
@@ -115,6 +117,7 @@ export interface CityBuildingPin {
   isHidden?: boolean;
   bossSlain?: boolean;
   interiorMaps?: SiteBattleMap[];
+  activeInteriorMapId?: string;
   fogOfWar?: FogOfWarState;
 }
 
@@ -192,6 +195,20 @@ export interface CampaignMediaAsset {
   url: string;
 }
 
+export interface LiveViewState {
+  regionId: string;
+  navLevel: 'realm' | 'city' | 'tavern';
+  cityLocationId?: string | null;
+  buildingId?: string | null;
+  battleMapLocationId?: string | null;
+  battleMapBuildingId?: string | null;
+  activeInteriorMapId?: string | null;
+  isBigMapOpen?: boolean;
+  showLines?: boolean;
+  showTownNames?: boolean;
+  updatedAt?: string;
+}
+
 export interface CampaignState {
   campaignName?: string;
   partyName?: string;
@@ -206,4 +223,6 @@ export interface CampaignState {
   initiativeRound?: number;
   currentTurnIndex?: number;
   mediaLibrary?: CampaignMediaAsset[];
+  liveView?: LiveViewState;
+  stateVersion?: number;
 }

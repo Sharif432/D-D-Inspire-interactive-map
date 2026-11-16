@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { CampaignLocation, LocationType, CampaignState, SiteBattleMap, CityBuildingPin, FogOfWarState, BuildingType, MapToken } from "../types";
+import { CampaignLocation, LocationType, CampaignState, SiteBattleMap, CityBuildingPin, FogOfWarState, BuildingType, MapToken, LiveViewState } from "../types";
 import { 
   Map, 
   MapPin, 
@@ -53,6 +53,11 @@ import {
 
 interface MapInterfaceProps {
   campaignState: CampaignState;
+  isDmMode?: boolean;
+  onSetIsDmMode?: (dm: boolean) => void;
+  followDm?: boolean;
+  onToggleFollowDm?: () => void;
+  onUpdateLiveView?: (liveView: LiveViewState) => Promise<void>;
   onMoveParty: (locationId: string) => Promise<void>;
   onToggleDiscovered: (locationId: string) => Promise<void>;
   onCreateLocation: (location: { name: string; description: string; type: LocationType; x: number; y: number; isHidden: boolean }) => Promise<void>;
@@ -107,6 +112,11 @@ export const REGION_PRESETS = [
 
 export default function MapInterface({
   campaignState,
+  isDmMode: externalDmMode,
+  onSetIsDmMode,
+  followDm = true,
+  onToggleFollowDm,
+  onUpdateLiveView,
   onMoveParty,
   onToggleDiscovered,
   onCreateLocation,
@@ -118,7 +128,9 @@ export default function MapInterface({
   onToggleHidden,
   onUpdateFog
 }: MapInterfaceProps) {
-  const [activeRegionId, setActiveRegionId] = useState<string>("sword_coast");
+  const [activeRegionId, setActiveRegionId] = useState<string>(
+    () => campaignState.liveView?.regionId || campaignState.currentRegionId || "sword_coast"
+  );
   const [selectedLocation, setSelectedLocation] = useState<CampaignLocation | null>(null);
   const [insideBattleMapLocation, setInsideBattleMapLocation] = useState<CampaignLocation | null>(null);
   const [insideBattleMapBuildingId, setInsideBattleMapBuildingId] = useState<string | null>(null);
@@ -131,10 +143,20 @@ export default function MapInterface({
   const [fogBrushRadius, setFogBrushRadius] = useState<number>(12);
   const [isFogToolbarOpen, setIsFogToolbarOpen] = useState<boolean>(false);
 
-  // DM Mode vs Player View
-  const [isDmMode, setIsDmMode] = useState<boolean>(true);
+  // DM Mode vs Player View (controlled from App.tsx when provided for per-browser persistence)
+  const [localDmMode, setLocalDmMode] = useState<boolean>(true);
+  const isDmMode = externalDmMode !== undefined ? externalDmMode : localDmMode;
+  const setIsDmMode = (val: boolean | ((prev: boolean) => boolean)) => {
+    const next = typeof val === "function" ? val(isDmMode) : val;
+    if (onSetIsDmMode) {
+      onSetIsDmMode(next);
+    } else {
+      setLocalDmMode(next);
+    }
+  };
   const [isDmRosterOpen, setIsDmRosterOpen] = useState(false);
   const [rosterSearch, setRosterSearch] = useState("");
+  const isApplyingLiveViewRef = useRef<boolean>(false);
 
   // Edit Location Modal State
   const [editingLocation, setEditingLocation] = useState<CampaignLocation | null>(null);
@@ -220,17 +242,22 @@ export default function MapInterface({
   const [newBuildingDesc, setNewBuildingDesc] = useState("");
   const [newBuildingType, setNewBuildingType] = useState<BuildingType>("tavern");
   const [newBuildingImageUrl, setNewBuildingImageUrl] = useState("");
+  const [newBuildingIsHidden, setNewBuildingIsHidden] = useState(false);
   const buildingFileInputRef = useRef<HTMLInputElement>(null);
 
-  // Pan & Zoom states (Unified for smooth drag & touch)
+  // Pan & Zoom states (Unified for smooth drag, wheel & touch across all map levels)
   const [zoomScale, setZoomScale] = useState<number>(1.0);
   const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [isDraggingMap, setIsDraggingMap] = useState<boolean>(false);
   const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
+  const didDragMapRef = useRef<boolean>(false);
   const touchDistanceRef = useRef<number | null>(null);
 
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const bigMapContainerRef = useRef<HTMLDivElement>(null);
+  const [standardViewportSize, setStandardViewportSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
+  const [bigViewportSize, setBigViewportSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
 
   const activeRegion = campaignState.regions.find((r) => r.id === activeRegionId) || campaignState.regions[0];
   const partyLocation = campaignState.locations.find((l) => l.id === campaignState.partyLocationId);
@@ -600,6 +627,7 @@ export default function MapInterface({
       x: tempBuildingCoords.x,
       y: tempBuildingCoords.y,
       imageUrl: finalImage,
+      isHidden: newBuildingIsHidden,
       interiorMaps: [
         {
           id: "map_taproom_" + Date.now(),
@@ -624,6 +652,7 @@ export default function MapInterface({
     setNewBuildingName("");
     setNewBuildingDesc("");
     setNewBuildingImageUrl("");
+    setNewBuildingIsHidden(false);
     setSelectedBuilding(newBuilding);
   };
 
@@ -633,6 +662,31 @@ export default function MapInterface({
     const updatedBuildings = (currentCityLocation.cityBuildings || []).map(b => 
       b.id === buildingId ? { ...b, bossSlain: !b.bossSlain } : b
     );
+    await onUpdateLocation({
+      id: currentCityLocation.id,
+      cityBuildings: updatedBuildings
+    });
+  };
+
+  // Toggle Building Hidden / Revealed (DM-only Place of Interest visibility control)
+  const handleToggleBuildingHidden = async (buildingId: string) => {
+    if (!currentCityLocation || !onUpdateLocation) return;
+    const updatedBuildings = (currentCityLocation.cityBuildings || []).map((b) =>
+      b.id === buildingId ? { ...b, isHidden: !b.isHidden } : b
+    );
+    await onUpdateLocation({
+      id: currentCityLocation.id,
+      cityBuildings: updatedBuildings
+    });
+  };
+
+  // Reveal or Hide all POIs in the active city (DM-only bulk helper)
+  const handleBulkToggleCityBuildingsHidden = async (hideAll: boolean) => {
+    if (!currentCityLocation || !onUpdateLocation) return;
+    const updatedBuildings = (currentCityLocation.cityBuildings || []).map((b) => ({
+      ...b,
+      isHidden: hideAll
+    }));
     await onUpdateLocation({
       id: currentCityLocation.id,
       cityBuildings: updatedBuildings
@@ -652,41 +706,278 @@ export default function MapInterface({
   useEffect(() => {
     if (selectedLocation) {
       const updated = campaignState.locations.find(l => l.id === selectedLocation.id);
-      if (updated) setSelectedLocation(updated);
+      if (updated) {
+        setSelectedLocation(updated);
+      } else {
+        setSelectedLocation(null);
+      }
     }
     if (selectedBuilding && currentCityLocationId) {
       const city = campaignState.locations.find(l => l.id === currentCityLocationId);
       const updatedBld = city?.cityBuildings?.find(b => b.id === selectedBuilding.id);
-      if (updatedBld) setSelectedBuilding(updatedBld);
+      if (updatedBld) {
+        setSelectedBuilding(updatedBld);
+      } else {
+        setSelectedBuilding(null);
+      }
+    }
+    if (insideBattleMapLocation) {
+      const updatedLoc = campaignState.locations.find(l => l.id === insideBattleMapLocation.id);
+      if (!updatedLoc) {
+        setInsideBattleMapLocation(null);
+        setInsideBattleMapBuildingId(null);
+      }
     }
   }, [campaignState.locations]);
 
-  // ==========================================
-  // PAN & ZOOM EVENT HANDLERS (MOUSE & TOUCH)
-  // ==========================================
-  const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
-    setZoomScale((prev) => Math.min(3.5, Math.max(0.6, parseFloat((prev * zoomFactor).toFixed(2)))));
-  };
+  // Clear DM-only editing tools if browser switches to Player View
+  useEffect(() => {
+    if (!isDmMode) {
+      setIsFogToolbarOpen(false);
+      setFogBrushMode("off");
+      setIsAddingLocation(false);
+      setIsAddingBuilding(false);
+      setRepositioningLocId(null);
+      setRepositioningBuildingId(null);
+      setIsDmRosterOpen(false);
+      setEditingLocation(null);
+      setEditingBuilding(null);
+      setMobileTab((prev) => (prev === "roster" ? "map" : prev));
+    }
+  }, [isDmMode]);
 
-  const handleMouseDown = (e: React.MouseEvent) => {
+  // Keep active region valid if campaign regions change (e.g. JSON import)
+  useEffect(() => {
+    if (!campaignState.regions.some((r) => r.id === activeRegionId)) {
+      setActiveRegionId(campaignState.currentRegionId || campaignState.regions[0]?.id || "sword_coast");
+    }
+  }, [campaignState.regions, campaignState.currentRegionId]);
+
+  // Player View: Mirror DM's live map, city, room/tavern, and battle view when Follow DM is ON
+  useEffect(() => {
+    const lv = campaignState.liveView;
+    if (!lv || isDmMode || !followDm) return;
+
+    isApplyingLiveViewRef.current = true;
+
+    if (lv.regionId && campaignState.regions.some((r) => r.id === lv.regionId)) {
+      setActiveRegionId(lv.regionId);
+    }
+    setMapNavLevel(lv.navLevel || "realm");
+    setCurrentCityLocationId(lv.cityLocationId ?? null);
+    setCurrentBuildingId(lv.buildingId ?? null);
+
+    if (lv.cityLocationId) {
+      const city = campaignState.locations.find((l) => l.id === lv.cityLocationId) || null;
+      if (city) {
+        setSelectedLocation(city);
+        if (lv.buildingId) {
+          const bld = city.cityBuildings?.find((b) => b.id === lv.buildingId) || null;
+          // Do not reveal or pull player into a DM-hidden city POI until DM reveals it
+          if (bld && !bld.isHidden) {
+            setSelectedBuilding(bld);
+          } else {
+            setSelectedBuilding(null);
+            setCurrentBuildingId(null);
+            if (lv.navLevel === "tavern") {
+              setMapNavLevel("city");
+            }
+          }
+        } else {
+          setSelectedBuilding(null);
+        }
+      }
+    } else if (lv.navLevel === "realm") {
+      setSelectedBuilding(null);
+    }
+
+    if (lv.battleMapLocationId) {
+      const battleLoc = campaignState.locations.find((l) => l.id === lv.battleMapLocationId) || null;
+      if (battleLoc && lv.battleMapBuildingId) {
+        const bld = battleLoc.cityBuildings?.find((b) => b.id === lv.battleMapBuildingId);
+        if (bld && !bld.isHidden) {
+          setInsideBattleMapBuildingId(lv.battleMapBuildingId);
+          setInsideBattleMapLocation({
+            ...battleLoc,
+            name: `${battleLoc.name} - ${bld.name}`,
+            interiorMaps: bld.interiorMaps,
+            activeInteriorMapId: lv.activeInteriorMapId || bld.activeInteriorMapId || bld.interiorMaps?.[0]?.id
+          });
+        } else {
+          setInsideBattleMapBuildingId(null);
+          setInsideBattleMapLocation(null);
+        }
+      } else {
+        setInsideBattleMapBuildingId(null);
+        setInsideBattleMapLocation(battleLoc);
+      }
+    } else {
+      setInsideBattleMapLocation(null);
+      setInsideBattleMapBuildingId(null);
+    }
+
+    if (lv.isBigMapOpen !== undefined) setIsBigMapOpen(!!lv.isBigMapOpen);
+    if (lv.showLines !== undefined) setShowLines(!!lv.showLines);
+    if (lv.showTownNames !== undefined) setShowTownNames(!!lv.showTownNames);
+
+    const timer = setTimeout(() => {
+      isApplyingLiveViewRef.current = false;
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [campaignState.liveView, campaignState.locations, campaignState.regions, isDmMode, followDm]);
+
+  // DM View: Broadcast active map/city/room/battle view whenever DM navigates
+  const currentBattleActiveMapId = (() => {
+    if (!insideBattleMapLocation) return null;
+    const freshLoc = campaignState.locations.find((l) => l.id === insideBattleMapLocation.id) || insideBattleMapLocation;
+    if (insideBattleMapBuildingId) {
+      const freshBld = freshLoc.cityBuildings?.find((b) => b.id === insideBattleMapBuildingId);
+      return freshBld?.activeInteriorMapId || freshBld?.interiorMaps?.[0]?.id || insideBattleMapLocation.activeInteriorMapId || null;
+    }
+    return freshLoc.activeInteriorMapId || freshLoc.interiorMaps?.[0]?.id || insideBattleMapLocation.activeInteriorMapId || null;
+  })();
+
+  useEffect(() => {
+    if (!isDmMode || !onUpdateLiveView || isApplyingLiveViewRef.current) return;
+
+    const existing = campaignState.liveView;
+    const nextBattleLocId = insideBattleMapLocation?.id ?? null;
+    const nextBattleBldId = insideBattleMapBuildingId ?? null;
+
     if (
-      isAddingLocation ||
-      isAddingBuilding ||
-      repositioningLocId ||
-      repositioningBuildingId ||
-      (isDmMode && activeFogOfWar?.enabled && fogBrushMode !== "off")
+      existing &&
+      existing.regionId === activeRegionId &&
+      existing.navLevel === mapNavLevel &&
+      (existing.cityLocationId ?? null) === (currentCityLocationId ?? null) &&
+      (existing.buildingId ?? null) === (currentBuildingId ?? null) &&
+      (existing.battleMapLocationId ?? null) === nextBattleLocId &&
+      (existing.battleMapBuildingId ?? null) === nextBattleBldId &&
+      (existing.activeInteriorMapId ?? null) === (currentBattleActiveMapId ?? null) &&
+      !!existing.isBigMapOpen === isBigMapOpen &&
+      (existing.showLines ?? true) === showLines &&
+      (existing.showTownNames ?? true) === showTownNames
     ) {
       return;
     }
-    if (e.button !== 0) return; // Only left click
+
+    onUpdateLiveView({
+      regionId: activeRegionId,
+      navLevel: mapNavLevel,
+      cityLocationId: currentCityLocationId ?? null,
+      buildingId: currentBuildingId ?? null,
+      battleMapLocationId: nextBattleLocId,
+      battleMapBuildingId: nextBattleBldId,
+      activeInteriorMapId: currentBattleActiveMapId,
+      isBigMapOpen,
+      showLines,
+      showTownNames
+    });
+  }, [
+    isDmMode,
+    activeRegionId,
+    mapNavLevel,
+    currentCityLocationId,
+    currentBuildingId,
+    insideBattleMapLocation?.id,
+    insideBattleMapBuildingId,
+    currentBattleActiveMapId,
+    isBigMapOpen,
+    showLines,
+    showTownNames
+  ]);
+
+  // ==========================================
+  // VIEWPORT SYNC & PAN/ZOOM EVENT HANDLERS
+  // ==========================================
+  const computeFittedBox = (viewport: { width: number; height: number }, aspect: number) => {
+    if (viewport.width <= 0 || viewport.height <= 0) return null;
+    const safeAspect = Number.isFinite(aspect) && aspect > 0 ? aspect : 16 / 9;
+    if (viewport.width / viewport.height >= safeAspect) {
+      const h = viewport.height;
+      return { width: Math.floor(h * safeAspect), height: Math.floor(h) };
+    }
+    const w = viewport.width;
+    return { width: Math.floor(w), height: Math.floor(w / safeAspect) };
+  };
+
+  const fittedStandardBox = computeFittedBox(standardViewportSize, mapAspect);
+  const fittedBigBox = computeFittedBox(bigViewportSize, mapAspect);
+
+  // Sync map viewport sizes with window/screen resizes
+  useEffect(() => {
+    const observers: ResizeObserver[] = [];
+    const bindObserver = (
+      el: HTMLDivElement | null,
+      setter: React.Dispatch<React.SetStateAction<{ width: number; height: number }>>
+    ) => {
+      if (!el) return;
+      const update = () => {
+        const rect = el.getBoundingClientRect();
+        setter({ width: Math.floor(rect.width), height: Math.floor(rect.height) });
+      };
+      update();
+      const ro = new ResizeObserver(update);
+      ro.observe(el);
+      observers.push(ro);
+    };
+    bindObserver(mapContainerRef.current, setStandardViewportSize);
+    bindObserver(bigMapContainerRef.current, setBigViewportSize);
+    return () => observers.forEach((ro) => ro.disconnect());
+  }, [isBigMapOpen, mobileTab]);
+
+  // Non-passive wheel listeners so mouse-wheel zoom never scrolls page or gets blocked
+  useEffect(() => {
+    const handleNativeWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
+      setZoomScale((prev) => Math.min(4.0, Math.max(0.5, parseFloat((prev * zoomFactor).toFixed(2)))));
+    };
+    const stdEl = mapContainerRef.current;
+    const bigEl = bigMapContainerRef.current;
+    stdEl?.addEventListener("wheel", handleNativeWheel, { passive: false });
+    bigEl?.addEventListener("wheel", handleNativeWheel, { passive: false });
+    return () => {
+      stdEl?.removeEventListener("wheel", handleNativeWheel);
+      bigEl?.removeEventListener("wheel", handleNativeWheel);
+    };
+  }, [isBigMapOpen, mobileTab]);
+
+  // Release drag reliably even if mouse is released outside canvas/window
+  useEffect(() => {
+    if (!isDraggingMap) return;
+    const handleGlobalMouseUp = () => {
+      setIsDraggingMap(false);
+      pointerDownPosRef.current = null;
+    };
+    window.addEventListener("mouseup", handleGlobalMouseUp);
+    return () => window.removeEventListener("mouseup", handleGlobalMouseUp);
+  }, [isDraggingMap]);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    // Allow Fog Brush to paint with left button; middle-button still pans
+    if (isDmMode && activeFogOfWar?.enabled && fogBrushMode !== "off" && e.button === 0) {
+      return;
+    }
+    if (e.button !== 0 && e.button !== 1) return;
+    if (e.button === 1) e.preventDefault();
     setIsDraggingMap(true);
+    didDragMapRef.current = false;
+    pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
     dragStartRef.current = { x: e.clientX - panOffset.x, y: e.clientY - panOffset.y };
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
     if (!isDraggingMap) return;
+    if (pointerDownPosRef.current) {
+      const moved = Math.hypot(
+        e.clientX - pointerDownPosRef.current.x,
+        e.clientY - pointerDownPosRef.current.y
+      );
+      if (moved > 5) {
+        didDragMapRef.current = true;
+      }
+    }
     setPanOffset({
       x: e.clientX - dragStartRef.current.x,
       y: e.clientY - dragStartRef.current.y
@@ -695,27 +986,25 @@ export default function MapInterface({
 
   const handleMouseUp = () => {
     setIsDraggingMap(false);
+    pointerDownPosRef.current = null;
   };
 
-  // Touch handlers for iPhone / mobile
+  // Touch handlers for tablet / mobile drag & 2-finger pinch zoom
   const handleTouchStart = (e: React.TouchEvent) => {
-    if (
-      isAddingLocation ||
-      isAddingBuilding ||
-      repositioningLocId ||
-      repositioningBuildingId ||
-      (isDmMode && activeFogOfWar?.enabled && fogBrushMode !== "off")
-    ) {
+    if (isDmMode && activeFogOfWar?.enabled && fogBrushMode !== "off" && e.touches.length === 1) {
       return;
     }
     if (e.touches.length === 1) {
       setIsDraggingMap(true);
+      didDragMapRef.current = false;
+      pointerDownPosRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
       dragStartRef.current = {
         x: e.touches[0].clientX - panOffset.x,
         y: e.touches[0].clientY - panOffset.y
       };
     } else if (e.touches.length === 2) {
-      // Pinch start
+      setIsDraggingMap(false);
+      didDragMapRef.current = true;
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       touchDistanceRef.current = Math.hypot(dx, dy);
@@ -724,6 +1013,15 @@ export default function MapInterface({
 
   const handleTouchMove = (e: React.TouchEvent) => {
     if (e.touches.length === 1 && isDraggingMap) {
+      if (pointerDownPosRef.current) {
+        const moved = Math.hypot(
+          e.touches[0].clientX - pointerDownPosRef.current.x,
+          e.touches[0].clientY - pointerDownPosRef.current.y
+        );
+        if (moved > 5) {
+          didDragMapRef.current = true;
+        }
+      }
       setPanOffset({
         x: e.touches[0].clientX - dragStartRef.current.x,
         y: e.touches[0].clientY - dragStartRef.current.y
@@ -733,7 +1031,7 @@ export default function MapInterface({
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       const newDistance = Math.hypot(dx, dy);
       const ratio = newDistance / touchDistanceRef.current;
-      setZoomScale((prev) => Math.min(3.5, Math.max(0.6, parseFloat((prev * ratio).toFixed(2)))));
+      setZoomScale((prev) => Math.min(4.0, Math.max(0.5, parseFloat((prev * ratio).toFixed(2)))));
       touchDistanceRef.current = newDistance;
     }
   };
@@ -741,6 +1039,7 @@ export default function MapInterface({
   const handleTouchEnd = () => {
     setIsDraggingMap(false);
     touchDistanceRef.current = null;
+    pointerDownPosRef.current = null;
   };
 
   // Center on Party or reset
@@ -763,6 +1062,10 @@ export default function MapInterface({
 
   // Handle Map Click (Adding Location, POI Building Pin, or Repositioning Pin across ALL map levels)
   const handleMapCanvasClick = async (e: React.MouseEvent<HTMLDivElement>) => {
+    if (didDragMapRef.current) {
+      didDragMapRef.current = false;
+      return;
+    }
     if (isDmMode && activeFogOfWar?.enabled && fogBrushMode !== "off") return;
     // Calculate against the exact inner transformed aspect-ratio canvas where map image & pins reside
     const targetCanvas = isBigMapOpen ? innerBigCanvasRef.current : innerCanvasRef.current;
@@ -1054,10 +1357,10 @@ export default function MapInterface({
   };
 
   return (
-    <div className="bg-[#0e1017] border border-white/10 rounded-2xl overflow-hidden shadow-2xl flex flex-col h-full font-sans text-slate-200">
+    <div className="bg-[#0e1017] border border-white/10 rounded-2xl overflow-hidden shadow-2xl flex flex-col h-full min-h-0 font-sans text-slate-200">
       
       {/* TOP HEADER CONTROLS (RESPONSIVE) */}
-      <div className="p-3 sm:p-4 bg-[#12141e] border-b border-white/10 flex flex-wrap items-center justify-between gap-2.5">
+      <div className="p-2.5 sm:p-3 bg-[#12141e] border-b border-white/10 flex flex-wrap items-center justify-between gap-2 shrink-0">
         
         {/* Left: Territory Title & Mode Switcher */}
         <div className="flex items-center flex-wrap gap-2 sm:gap-3">
@@ -1094,16 +1397,35 @@ export default function MapInterface({
             </button>
           </div>
 
+          {/* Follow DM View Toggle (shown in Player View) */}
+          {!isDmMode && onToggleFollowDm && (
+            <button
+              onClick={onToggleFollowDm}
+              className={`px-2.5 py-1 rounded-lg border text-xs font-mono font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                followDm
+                  ? "bg-emerald-950/70 text-emerald-300 border-emerald-500/50"
+                  : "bg-[#1a1d2c] text-slate-400 border-white/10 hover:text-white"
+              }`}
+              title="Follow DM's active map, city, room, and battle grid automatically"
+            >
+              <span>{followDm ? "📡 Follow DM: ON" : "📡 Follow DM: OFF"}</span>
+            </button>
+          )}
+
           {/* DM Roster / Secret Toggle Button */}
           {isDmMode && (
             <button
               onClick={() => setIsDmRosterOpen(!isDmRosterOpen)}
               className="px-2.5 py-1 bg-purple-950/40 hover:bg-purple-900/50 border border-purple-500/30 text-purple-300 rounded-lg text-xs font-mono flex items-center gap-1.5 transition-all cursor-pointer"
-              title="Toggle Secret Locations on/off by name"
+              title={mapNavLevel === "city" ? "Manage hidden/visible city Places of Interest" : "Toggle Secret Locations on/off by name"}
             >
               <Eye className="w-3.5 h-3.5 text-purple-400" />
-              <span className="hidden sm:inline">Secret Roster ({regionLocations.filter(l => l.isHidden).length} hidden)</span>
-              <span className="sm:hidden">Roster</span>
+              <span className="hidden sm:inline">
+                {mapNavLevel === "city" && currentCityLocation
+                  ? `City POIs (${(currentCityLocation.cityBuildings || []).filter((b) => b.isHidden).length} hidden)`
+                  : `Secret Roster (${regionLocations.filter((l) => l.isHidden).length} hidden)`}
+              </span>
+              <span className="sm:hidden">{mapNavLevel === "city" ? "City POIs" : "Roster"}</span>
             </button>
           )}
         </div>
@@ -1220,7 +1542,7 @@ export default function MapInterface({
       </div>
 
       {/* MULTI-LEVEL MAP HIERARCHY BREADCRUMB HEADER */}
-      <div className="bg-[#0c0e14] border-b border-white/10 px-4 py-2 flex flex-wrap items-center justify-between gap-2 shadow-inner">
+      <div className="bg-[#0c0e14] border-b border-white/10 px-3 sm:px-4 py-1.5 flex flex-wrap items-center justify-between gap-2 shadow-inner shrink-0">
         <div className="flex items-center space-x-2 text-xs font-mono">
           <button
             onClick={handleReturnToRealm}
@@ -1319,7 +1641,7 @@ export default function MapInterface({
       </div>
 
       {/* MOBILE DEVICE TAB SWITCHER (For iPhone & small screens) */}
-      <div className="lg:hidden flex border-b border-white/10 bg-[#12141e] text-xs font-mono">
+      <div className="lg:hidden flex border-b border-white/10 bg-[#12141e] text-xs font-mono shrink-0">
         <button
           onClick={() => setMobileTab("map")}
           className={`flex-1 py-2 text-center transition-colors ${
@@ -1343,7 +1665,7 @@ export default function MapInterface({
               mobileTab === "roster" ? "bg-purple-500/10 text-purple-300 font-bold border-b-2 border-purple-500" : "text-slate-400"
             }`}
           >
-            👁️ Secret Roster
+            👁️ {mapNavLevel === "city" ? "Secret POIs" : "Secret Roster"}
           </button>
         )}
       </div>
@@ -1528,21 +1850,21 @@ export default function MapInterface({
         
         {/* MAP CANVAS VIEWPORT */}
         <div 
-          className={`flex-1 flex flex-col relative overflow-hidden bg-[#07090e] ${
+          className={`flex-1 min-h-0 flex flex-col relative overflow-hidden bg-[#07090e] ${
             mobileTab !== "map" ? "hidden lg:flex" : "flex"
           }`}
         >
           {/* FLOATING HUD CONTROLS (PAN & ZOOM HUD) */}
           <div className="absolute top-3 right-3 z-30 flex flex-col space-y-1.5 bg-[#0f111a]/90 backdrop-blur-md border border-white/10 rounded-xl p-1.5 shadow-xl">
             <button
-              onClick={() => setZoomScale((prev) => Math.min(3.5, parseFloat((prev + 0.2).toFixed(2))))}
+              onClick={() => setZoomScale((prev) => Math.min(4.0, parseFloat((prev + 0.25).toFixed(2))))}
               className="p-2 hover:bg-white/10 rounded-lg text-slate-300 hover:text-white transition-colors cursor-pointer"
               title="Zoom In (+)"
             >
               <ZoomIn className="w-4 h-4" />
             </button>
             <button
-              onClick={() => setZoomScale((prev) => Math.max(0.6, parseFloat((prev - 0.2).toFixed(2))))}
+              onClick={() => setZoomScale((prev) => Math.max(0.5, parseFloat((prev - 0.25).toFixed(2))))}
               className="p-2 hover:bg-white/10 rounded-lg text-slate-300 hover:text-white transition-colors cursor-pointer"
               title="Zoom Out (-)"
             >
@@ -1603,7 +1925,6 @@ export default function MapInterface({
           {/* INTERACTIVE PANNABLE & ZOOMABLE CANVAS */}
           <div
             ref={mapContainerRef}
-            onWheel={handleWheel}
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
@@ -1611,9 +1932,10 @@ export default function MapInterface({
             onTouchMove={handleTouchMove}
             onTouchEnd={handleTouchEnd}
             onClick={handleMapCanvasClick}
-            className={`relative flex-1 w-full h-full select-none overflow-hidden ${
+            style={{ touchAction: "none" }}
+            className={`relative flex-1 min-h-0 w-full h-full flex items-center justify-center select-none overflow-hidden ${
               repositioningLocId || repositioningBuildingId || isAddingLocation || isAddingBuilding
-                ? "cursor-crosshair" 
+                ? isDraggingMap ? "cursor-grabbing" : "cursor-crosshair" 
                 : isDraggingMap 
                 ? "cursor-grabbing" 
                 : "cursor-grab"
@@ -1626,13 +1948,13 @@ export default function MapInterface({
                 transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`,
                 transformOrigin: "center center",
                 transition: isDraggingMap ? "none" : "transform 0.08s ease-out",
-                width: mapAspect >= 1 ? "100%" : "auto",
-                height: mapAspect < 1 ? "100%" : "auto",
+                width: fittedStandardBox ? `${fittedStandardBox.width}px` : mapAspect >= 1 ? "100%" : "auto",
+                height: fittedStandardBox ? `${fittedStandardBox.height}px` : mapAspect < 1 ? "100%" : "auto",
                 aspectRatio: `${mapAspect}`,
-                maxHeight: "100%",
-                maxWidth: "100%"
+                maxHeight: fittedStandardBox ? undefined : "100%",
+                maxWidth: fittedStandardBox ? undefined : "100%"
               }}
-              className="relative m-auto"
+              className="relative shrink-0"
             >
               {/* Regional, City, or Tavern Map Background Image (100% Uncropped Edge-to-Edge) */}
               <img
@@ -1890,7 +2212,7 @@ export default function MapInterface({
               )}
 
               {/* LEVEL 3: TAVERN INTERIOR ROOM / MAP PROMPT */}
-              {mapNavLevel === "tavern" && currentBuilding && (isDmMode || isPointVisibleToPlayers(currentBuilding.fogOfWar, 50, 50, mapAspect)) && (
+              {mapNavLevel === "tavern" && currentBuilding && (isDmMode || (!currentBuilding.isHidden && isPointVisibleToPlayers(currentBuilding.fogOfWar, 50, 50, mapAspect))) && (
                 <div className="absolute inset-0 flex items-center justify-center p-6 pointer-events-none z-20">
                   <div className="bg-black/85 backdrop-blur-md border border-amber-500/40 rounded-2xl p-6 text-center max-w-md shadow-2xl pointer-events-auto space-y-3">
                     <span className="text-4xl">{getBuildingIcon(currentBuilding.type)}</span>
@@ -1935,105 +2257,194 @@ export default function MapInterface({
 
         {/* SIDE PANEL: SCRIBE & LOCATION DETAILS / DM ROSTER (RESPONSIVE) */}
         <div 
-          className={`w-full lg:w-96 bg-[#0f111a] border-t lg:border-t-0 lg:border-l border-white/10 p-4 sm:p-5 flex flex-col justify-between shrink-0 overflow-y-auto space-y-4 ${
-            mobileTab === "map" ? "hidden lg:flex" : "flex"
+          className={`w-full lg:w-96 min-h-0 max-h-full bg-[#0f111a] border-t lg:border-t-0 lg:border-l border-white/10 p-4 sm:p-5 flex flex-col justify-between shrink-0 overflow-y-auto space-y-4 ${
+            mobileTab === "map" ? "hidden lg:flex" : "flex flex-1 lg:flex-none"
           }`}
         >
-          {/* VIEW A: DM SECRET ROSTER TAB */}
-          {mobileTab === "roster" || (isDmRosterOpen && mobileTab !== "details") ? (
+          {/* VIEW A: DM SECRET ROSTER TAB (Context-aware for City POIs & Realm Locations) */}
+          {(mobileTab === "roster" || (isDmRosterOpen && mobileTab !== "details")) && isDmMode ? (
             <div className="space-y-4">
               <div className="flex items-center justify-between border-b border-white/10 pb-3">
                 <div className="flex items-center space-x-2">
                   <Eye className="w-4 h-4 text-purple-400" />
                   <h3 className="text-sm font-bold font-mono uppercase tracking-wider text-purple-300">
-                    DM Secret Location Roster
+                    {mapNavLevel === "city" && currentCityLocation
+                      ? `DM Secret POIs: ${currentCityLocation.name}`
+                      : "DM Secret Location Roster"}
                   </h3>
                 </div>
                 <button
                   onClick={() => setIsDmRosterOpen(false)}
-                  className="text-slate-400 hover:text-white text-xs font-mono"
+                  className="text-slate-400 hover:text-white text-xs font-mono cursor-pointer"
                 >
                   Close
                 </button>
               </div>
 
               <p className="text-2xs font-mono text-slate-400 leading-relaxed">
-                Toggle any location visible or hidden from players by its name. Secret locations remain hidden until you reveal them!
+                {mapNavLevel === "city" && currentCityLocation
+                  ? "Hide taverns, shops, or secret rooms from players until they discover them or you tell them the location."
+                  : "Toggle any location visible or hidden from players by its name. Secret locations remain hidden until you reveal them!"}
               </p>
+
+              {/* Bulk Reveal / Hide controls for City POIs */}
+              {mapNavLevel === "city" && currentCityLocation && (currentCityLocation.cityBuildings || []).length > 0 && (
+                <div className="grid grid-cols-2 gap-2 text-2xs font-mono">
+                  <button
+                    onClick={() => handleBulkToggleCityBuildingsHidden(false)}
+                    className="py-1.5 px-2.5 bg-emerald-950/40 hover:bg-emerald-900/50 border border-emerald-500/30 text-emerald-300 rounded-lg font-bold cursor-pointer flex items-center justify-center gap-1"
+                  >
+                    <Eye className="w-3 h-3" />
+                    <span>Reveal All POIs</span>
+                  </button>
+                  <button
+                    onClick={() => handleBulkToggleCityBuildingsHidden(true)}
+                    className="py-1.5 px-2.5 bg-purple-950/50 hover:bg-purple-900/60 border border-purple-500/30 text-purple-300 rounded-lg font-bold cursor-pointer flex items-center justify-center gap-1"
+                  >
+                    <EyeOff className="w-3 h-3" />
+                    <span>Hide All POIs</span>
+                  </button>
+                </div>
+              )}
 
               {/* Search filter input */}
               <div className="relative">
                 <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" />
                 <input
                   type="text"
-                  placeholder="Find location by name..."
+                  placeholder={mapNavLevel === "city" ? "Find tavern, shop, or POI..." : "Find location by name..."}
                   value={rosterSearch}
                   onChange={(e) => setRosterSearch(e.target.value)}
                   className="w-full bg-[#171a26] border border-white/10 pl-8 pr-3 py-1.5 rounded-lg text-xs font-mono text-slate-200 focus:outline-none focus:border-purple-500"
                 />
               </div>
 
-              {/* Roster list */}
-              <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
-                {regionLocations
-                  .filter((l) => !rosterSearch || l.name.toLowerCase().includes(rosterSearch.toLowerCase()))
-                  .map((loc) => {
-                    const isHidden = !!loc.isHidden;
-                    const isBossSlain = !!loc.bossSlain;
+              {/* Roster list: City POIs when in City view, Realm Locations otherwise */}
+              <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+                {mapNavLevel === "city" && currentCityLocation ? (
+                  (currentCityLocation.cityBuildings || []).length === 0 ? (
+                    <div className="p-4 rounded-xl bg-[#141622] border border-white/5 text-center text-2xs font-mono text-slate-400">
+                      No Places of Interest in {currentCityLocation.name} yet. Click <span className="text-amber-400 font-bold">+ Add POI Pin</span> to add taverns, shops, or secret hideouts.
+                    </div>
+                  ) : (
+                    (currentCityLocation.cityBuildings || [])
+                      .filter((b) => !rosterSearch || b.name.toLowerCase().includes(rosterSearch.toLowerCase()))
+                      .map((bld) => {
+                        const isHidden = !!bld.isHidden;
+                        const isBossSlain = !!bld.bossSlain;
 
-                    return (
-                      <div
-                        key={`roster-${loc.id}`}
-                        onClick={() => {
-                          setSelectedLocation(loc);
-                          setMobileTab("details");
-                        }}
-                        className={`p-3 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-2 ${
-                          isHidden
-                            ? "bg-purple-950/20 border-purple-500/30 hover:border-purple-400"
-                            : "bg-[#141622] border-white/5 hover:border-white/15"
-                        }`}
-                      >
-                        <div className="flex items-center space-x-2 min-w-0">
-                          <span className="text-base shrink-0">{getLocationIcon(loc.type)}</span>
-                          <div className="truncate">
-                            <div className="flex items-center space-x-1.5">
-                              <span className="font-bold text-xs text-white truncate">{loc.name}</span>
-                              {isBossSlain && <span className="text-red-400 text-2xs font-mono font-bold">💀 SLAIN</span>}
+                        return (
+                          <div
+                            key={`roster-bld-${bld.id}`}
+                            onClick={() => {
+                              setSelectedBuilding(bld);
+                              setMobileTab("details");
+                            }}
+                            className={`p-3 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-2 ${
+                              isHidden
+                                ? "bg-purple-950/20 border-purple-500/30 hover:border-purple-400"
+                                : "bg-[#141622] border-white/5 hover:border-white/15"
+                            }`}
+                          >
+                            <div className="flex items-center space-x-2 min-w-0">
+                              <span className="text-base shrink-0">{getBuildingIcon(bld.type)}</span>
+                              <div className="truncate">
+                                <div className="flex items-center space-x-1.5">
+                                  <span className="font-bold text-xs text-white truncate">{bld.name}</span>
+                                  {isBossSlain && <span className="text-red-400 text-2xs font-mono font-bold">💀 SLAIN</span>}
+                                </div>
+                                <span className="text-3xs font-mono text-slate-400 capitalize block">
+                                  {bld.type.replace("_", " ")} • {isHidden ? "Hidden from Players" : "Visible to Players"}
+                                </span>
+                              </div>
                             </div>
-                            <span className="text-3xs font-mono text-slate-400 capitalize block">
-                              {loc.type} • Danger Tier {loc.dangerLevel || 1}
-                            </span>
+
+                            <div className="flex items-center space-x-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                              <button
+                                onClick={() => handleToggleBuildingHidden(bld.id)}
+                                className={`p-1.5 rounded-lg border text-xs transition-colors cursor-pointer ${
+                                  isHidden
+                                    ? "bg-purple-900/60 border-purple-400 text-purple-300 hover:bg-purple-800"
+                                    : "bg-emerald-950/40 border-emerald-500/30 text-emerald-300 hover:bg-emerald-900/50"
+                                }`}
+                                title={isHidden ? "Currently hidden from players. Click to reveal!" : "Visible to players. Click to hide!"}
+                              >
+                                {isHidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                              </button>
+
+                              <button
+                                onClick={() => openEditBuildingModal(bld)}
+                                className="p-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-slate-300 hover:text-white cursor-pointer"
+                                title="Edit this Place of Interest"
+                              >
+                                <Edit2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                  )
+                ) : (
+                  regionLocations
+                    .filter((l) => !rosterSearch || l.name.toLowerCase().includes(rosterSearch.toLowerCase()))
+                    .map((loc) => {
+                      const isHidden = !!loc.isHidden;
+                      const isBossSlain = !!loc.bossSlain;
+
+                      return (
+                        <div
+                          key={`roster-${loc.id}`}
+                          onClick={() => {
+                            setSelectedLocation(loc);
+                            setMobileTab("details");
+                          }}
+                          className={`p-3 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-2 ${
+                            isHidden
+                              ? "bg-purple-950/20 border-purple-500/30 hover:border-purple-400"
+                              : "bg-[#141622] border-white/5 hover:border-white/15"
+                          }`}
+                        >
+                          <div className="flex items-center space-x-2 min-w-0">
+                            <span className="text-base shrink-0">{getLocationIcon(loc.type)}</span>
+                            <div className="truncate">
+                              <div className="flex items-center space-x-1.5">
+                                <span className="font-bold text-xs text-white truncate">{loc.name}</span>
+                                {isBossSlain && <span className="text-red-400 text-2xs font-mono font-bold">💀 SLAIN</span>}
+                              </div>
+                              <span className="text-3xs font-mono text-slate-400 capitalize block">
+                                {loc.type} • Danger Tier {loc.dangerLevel || 1}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* 1-Click Eye toggle by name */}
+                          <div className="flex items-center space-x-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              onClick={async () => {
+                                if (onToggleHidden) await onToggleHidden(loc.id);
+                              }}
+                              className={`p-1.5 rounded-lg border text-xs transition-colors cursor-pointer ${
+                                isHidden
+                                  ? "bg-purple-900/60 border-purple-400 text-purple-300 hover:bg-purple-800"
+                                  : "bg-emerald-950/40 border-emerald-500/30 text-emerald-300 hover:bg-emerald-900/50"
+                              }`}
+                              title={isHidden ? "Currently hidden from players. Click to reveal!" : "Visible to players. Click to hide!"}
+                            >
+                              {isHidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                            </button>
+
+                            <button
+                              onClick={() => openEditModal(loc)}
+                              className="p-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-slate-300 hover:text-white cursor-pointer"
+                              title="Edit this location"
+                            >
+                              <Edit2 className="w-3.5 h-3.5" />
+                            </button>
                           </div>
                         </div>
-
-                        {/* 1-Click Eye toggle by name */}
-                        <div className="flex items-center space-x-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
-                          <button
-                            onClick={async () => {
-                              if (onToggleHidden) await onToggleHidden(loc.id);
-                            }}
-                            className={`p-1.5 rounded-lg border text-xs transition-colors cursor-pointer ${
-                              isHidden
-                                ? "bg-purple-900/60 border-purple-400 text-purple-300 hover:bg-purple-800"
-                                : "bg-emerald-950/40 border-emerald-500/30 text-emerald-300 hover:bg-emerald-900/50"
-                            }`}
-                            title={isHidden ? "Currently hidden from players. Click to reveal!" : "Visible to players. Click to hide!"}
-                          >
-                            {isHidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                          </button>
-
-                          <button
-                            onClick={() => openEditModal(loc)}
-                            className="p-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-slate-300 hover:text-white"
-                            title="Edit this location"
-                          >
-                            <Edit2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })
+                )}
               </div>
             </div>
           ) : mapNavLevel === "city" && canViewSelectedBuilding && selectedBuilding ? (
@@ -2048,6 +2459,11 @@ export default function MapInterface({
                     {selectedBuilding.bossSlain && (
                       <span className="bg-red-950/80 text-red-300 border border-red-500/50 text-[9px] font-mono px-2 py-0.5 rounded font-bold">
                         💀 CLEARED / BOSS SLAIN (X)
+                      </span>
+                    )}
+                    {selectedBuilding.isHidden && isDmMode && (
+                      <span className="bg-purple-950/80 text-purple-300 border border-purple-500/50 text-[9px] font-mono px-2 py-0.5 rounded flex items-center gap-1 font-bold">
+                        <EyeOff className="w-2.5 h-2.5" /> Secret (DM Only)
                       </span>
                     )}
                   </div>
@@ -2104,29 +2520,53 @@ export default function MapInterface({
                   <span>⚔️ Enter Interior & Tactical Combat Grid</span>
                 </button>
 
-                {/* DM Reposition Pin & Boss Slain Controls */}
+                {/* DM Hide/Reveal, Reposition Pin & Boss Slain Controls */}
                 {isDmMode && (
-                  <div className="grid grid-cols-2 gap-2">
+                  <>
                     <button
-                      onClick={() => setRepositioningBuildingId(selectedBuilding.id)}
-                      className="py-2 px-3 bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 hover:text-white rounded-xl text-2xs font-mono uppercase transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                      onClick={() => handleToggleBuildingHidden(selectedBuilding.id)}
+                      className={`w-full py-2 px-3 rounded-xl border font-mono text-2xs uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                        selectedBuilding.isHidden
+                          ? "bg-purple-950/60 hover:bg-purple-900/70 border-purple-500 text-purple-200 font-bold"
+                          : "bg-emerald-950/30 hover:bg-emerald-950/50 border-emerald-500/40 text-emerald-300 font-bold"
+                      }`}
+                      title="Toggle whether players can see this Place of Interest on the city map"
                     >
-                      <Move className="w-3.5 h-3.5 text-amber-400" />
-                      <span>Relocate Pin</span>
+                      {selectedBuilding.isHidden ? (
+                        <>
+                          <EyeOff className="w-3.5 h-3.5 text-purple-400" />
+                          <span>Hidden from Players • Click to Reveal</span>
+                        </>
+                      ) : (
+                        <>
+                          <Eye className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Visible to Players • Click to Hide</span>
+                        </>
+                      )}
                     </button>
 
-                    <button
-                      onClick={() => handleToggleBuildingBossSlain(selectedBuilding.id)}
-                      className={`py-2 px-3 rounded-xl border font-mono text-2xs uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
-                        selectedBuilding.bossSlain
-                          ? "bg-red-950/60 border-red-500 text-red-300 font-bold"
-                          : "bg-[#141622] border-white/10 text-slate-400 hover:text-white"
-                      }`}
-                    >
-                      <Skull className="w-3.5 h-3.5 text-red-400" />
-                      <span>{selectedBuilding.bossSlain ? "Cleared (X)" : "Boss Slain"}</span>
-                    </button>
-                  </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        onClick={() => setRepositioningBuildingId(selectedBuilding.id)}
+                        className="py-2 px-3 bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 hover:text-white rounded-xl text-2xs font-mono uppercase transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <Move className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Relocate Pin</span>
+                      </button>
+
+                      <button
+                        onClick={() => handleToggleBuildingBossSlain(selectedBuilding.id)}
+                        className={`py-2 px-3 rounded-xl border font-mono text-2xs uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                          selectedBuilding.bossSlain
+                            ? "bg-red-950/60 border-red-500 text-red-300 font-bold"
+                            : "bg-[#141622] border-white/10 text-slate-400 hover:text-white"
+                        }`}
+                      >
+                        <Skull className="w-3.5 h-3.5 text-red-400" />
+                        <span>{selectedBuilding.bossSlain ? "Cleared (X)" : "Boss Slain"}</span>
+                      </button>
+                    </div>
+                  </>
                 )}
               </div>
             </div>
@@ -2290,15 +2730,21 @@ export default function MapInterface({
             </div>
           ) : (
             /* VIEW C: EMPTY / DEFAULT STATE */
-            <div className="text-center py-16 space-y-3 font-mono text-xs text-slate-500">
+            <div className="text-center py-12 space-y-3 font-mono text-xs text-slate-500">
               <Compass className="w-10 h-10 text-slate-650 mx-auto animate-pulse" />
-              <p>Select any location marker on the map to inspect lore, battle chambers, or reposition.</p>
+              <p>
+                {mapNavLevel === "city" && currentCityLocation
+                  ? `Select any Place of Interest marker in ${currentCityLocation.name} to inspect or enter its interior.`
+                  : "Select any location marker on the map to inspect lore, battle chambers, or reposition."}
+              </p>
               {isDmMode && (
                 <button
                   onClick={() => setIsDmRosterOpen(true)}
-                  className="px-3 py-1.5 bg-purple-950/40 border border-purple-500/30 text-purple-300 rounded-lg text-xs"
+                  className="px-3 py-1.5 bg-purple-950/40 hover:bg-purple-900/50 border border-purple-500/30 text-purple-300 rounded-lg text-xs cursor-pointer"
                 >
-                  Open Secret Locations Roster
+                  {mapNavLevel === "city" && currentCityLocation
+                    ? `Manage Hidden City POIs (${(currentCityLocation.cityBuildings || []).filter((b) => b.isHidden).length} hidden)`
+                    : "Open Secret Locations Roster"}
                 </button>
               )}
             </div>
@@ -2306,7 +2752,15 @@ export default function MapInterface({
 
           {/* Quick Footer Details */}
           <div className="border-t border-white/10 pt-3 flex items-center justify-between text-3xs font-mono text-slate-500">
-            <span>Locations in Territory: {regionLocations.length}</span>
+            <span>
+              {mapNavLevel === "city" && currentCityLocation
+                ? `POIs in ${currentCityLocation.name}: ${visibleCityBuildings.length}${
+                    isDmMode && (currentCityLocation.cityBuildings || []).some((b) => b.isHidden)
+                      ? ` (${(currentCityLocation.cityBuildings || []).filter((b) => b.isHidden).length} hidden)`
+                      : ""
+                  }`
+                : `Locations in Territory: ${isDmMode ? regionLocations.length : visibleLocations.length}`}
+            </span>
             <span className="text-amber-500">Faerûn Cartography v2.0</span>
           </div>
         </div>
@@ -2885,6 +3339,18 @@ export default function MapInterface({
                   {renderSavedImagesPicker((url) => setNewBuildingImageUrl(url), newBuildingImageUrl)}
                 </div>
 
+                <label className="flex items-center space-x-2 cursor-pointer bg-[#141624] p-2.5 rounded-lg border border-purple-500/20">
+                  <input
+                    type="checkbox"
+                    checked={newBuildingIsHidden}
+                    onChange={(e) => setNewBuildingIsHidden(e.target.checked)}
+                    className="rounded bg-[#1a1d2e] border-white/20 text-purple-600 focus:ring-0"
+                  />
+                  <span className="text-2xs text-purple-300 font-mono font-bold">
+                    👁️ Mark Secret (Hidden from Players until revealed by DM)
+                  </span>
+                </label>
+
                 <div className="flex gap-2 pt-2">
                   <button
                     type="submit"
@@ -3162,6 +3628,19 @@ export default function MapInterface({
                   </button>
                 )}
 
+                {!isDmMode && onToggleFollowDm && (
+                  <button
+                    onClick={onToggleFollowDm}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-bold border flex items-center gap-1.5 cursor-pointer ${
+                      followDm
+                        ? "bg-emerald-950/70 text-emerald-300 border-emerald-500/50"
+                        : "bg-[#171a26] text-slate-400 border-white/10 hover:text-white"
+                    }`}
+                  >
+                    <span>{followDm ? "📡 Follow DM: ON" : "📡 Follow DM: OFF"}</span>
+                  </button>
+                )}
+
                 <button
                   onClick={() => setIsDmMode(!isDmMode)}
                   className={`px-2.5 py-1.5 rounded-lg text-xs font-mono flex items-center gap-1.5 cursor-pointer ${
@@ -3275,7 +3754,6 @@ export default function MapInterface({
             {/* Big Map Body with Floating HUD and Pannable Canvas */}
             <div 
               ref={bigMapContainerRef}
-              onWheel={handleWheel}
               onMouseDown={handleMouseDown}
               onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp}
@@ -3283,9 +3761,10 @@ export default function MapInterface({
               onTouchMove={handleTouchMove}
               onTouchEnd={handleTouchEnd}
               onClick={handleMapCanvasClick}
-              className={`relative flex-1 w-full h-full overflow-hidden select-none ${
+              style={{ touchAction: "none" }}
+              className={`relative flex-1 min-h-0 w-full h-full flex items-center justify-center overflow-hidden select-none ${
                 repositioningLocId || repositioningBuildingId || isAddingLocation || isAddingBuilding
-                  ? "cursor-crosshair"
+                  ? isDraggingMap ? "cursor-grabbing" : "cursor-crosshair"
                   : isDraggingMap
                   ? "cursor-grabbing"
                   : "cursor-grab"
@@ -3365,14 +3844,14 @@ export default function MapInterface({
                 </div>
 
                 <button
-                  onClick={() => setZoomScale((prev) => Math.min(3.5, parseFloat((prev + 0.25).toFixed(2))))}
+                  onClick={() => setZoomScale((prev) => Math.min(4.0, parseFloat((prev + 0.25).toFixed(2))))}
                   className="p-2 hover:bg-white/10 rounded-lg text-white cursor-pointer"
                   title="Zoom In"
                 >
                   <ZoomIn className="w-4 h-4" />
                 </button>
                 <button
-                  onClick={() => setZoomScale((prev) => Math.max(0.6, parseFloat((prev - 0.25).toFixed(2))))}
+                  onClick={() => setZoomScale((prev) => Math.max(0.5, parseFloat((prev - 0.25).toFixed(2))))}
                   className="p-2 hover:bg-white/10 rounded-lg text-white cursor-pointer"
                   title="Zoom Out"
                 >
@@ -3401,13 +3880,13 @@ export default function MapInterface({
                   transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`,
                   transformOrigin: "center center",
                   transition: isDraggingMap ? "none" : "transform 0.08s ease-out",
-                  width: mapAspect >= 1 ? "100%" : "auto",
-                  height: mapAspect < 1 ? "100%" : "auto",
+                  width: fittedBigBox ? `${fittedBigBox.width}px` : mapAspect >= 1 ? "100%" : "auto",
+                  height: fittedBigBox ? `${fittedBigBox.height}px` : mapAspect < 1 ? "100%" : "auto",
                   aspectRatio: `${mapAspect}`,
-                  maxHeight: "100%",
-                  maxWidth: "100%"
+                  maxHeight: fittedBigBox ? undefined : "100%",
+                  maxWidth: fittedBigBox ? undefined : "100%"
                 }}
-                className="relative m-auto"
+                className="relative shrink-0"
               >
                 <img
                   src={
@@ -3505,6 +3984,12 @@ export default function MapInterface({
                             </svg>
                           </div>
                         )}
+
+                        {loc.isHidden && isDmMode && (
+                          <span className="absolute -top-1.5 -right-1.5 bg-purple-900 border border-purple-400 rounded-full p-0.5 text-purple-200">
+                            <EyeOff className="w-2.5 h-2.5" />
+                          </span>
+                        )}
                       </button>
 
                       {showTownNames && (
@@ -3550,6 +4035,12 @@ export default function MapInterface({
                             }`}
                           >
                             <span className={`${pinSizeCfg.bigBldEmoji} select-none leading-none`}>{getBuildingIcon(bld.type)}</span>
+
+                            {bld.isHidden && isDmMode && (
+                              <span className="absolute -top-1.5 -right-1.5 bg-purple-900 border border-purple-400 rounded-full p-0.5 text-purple-200">
+                                <EyeOff className="w-2.5 h-2.5" />
+                              </span>
+                            )}
 
                             {isBossSlain && (
                               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
@@ -3607,10 +4098,15 @@ export default function MapInterface({
                 <div className="absolute bottom-5 left-1/2 transform -translate-x-1/2 z-40 bg-[#0e1017]/95 border border-amber-500/40 p-3 sm:p-4 rounded-2xl shadow-2xl backdrop-blur-md flex flex-wrap items-center gap-3 max-w-3xl w-[92%]">
                   <span className="text-3xl select-none">{getBuildingIcon(selectedBuilding.type)}</span>
                   <div className="flex-1 min-w-[160px]">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <h4 className="font-serif italic font-bold text-white text-sm sm:text-base truncate">
                         {selectedBuilding.name}
                       </h4>
+                      {selectedBuilding.isHidden && isDmMode && (
+                        <span className="text-2xs font-mono text-purple-300 font-bold bg-purple-950/70 px-1.5 py-0.5 rounded border border-purple-500/50 flex items-center gap-1">
+                          <EyeOff className="w-3 h-3" /> Secret
+                        </span>
+                      )}
                       {selectedBuilding.bossSlain && (
                         <span className="text-2xs font-mono text-red-400 font-bold bg-red-950/60 px-1.5 py-0.5 rounded border border-red-500/40">
                           💀 CLEARED
@@ -3624,6 +4120,21 @@ export default function MapInterface({
                   <div className="flex items-center flex-wrap gap-1.5 shrink-0">
                     {isDmMode && (
                       <>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleToggleBuildingHidden(selectedBuilding.id);
+                          }}
+                          className={`px-2.5 py-2 font-mono text-xs font-bold rounded-xl flex items-center gap-1 cursor-pointer border ${
+                            selectedBuilding.isHidden
+                              ? "bg-purple-950/70 hover:bg-purple-900/80 text-purple-200 border-purple-500/50"
+                              : "bg-emerald-950/50 hover:bg-emerald-900/60 text-emerald-300 border-emerald-500/40"
+                          }`}
+                          title={selectedBuilding.isHidden ? "Click to reveal POI to players" : "Click to hide POI from players"}
+                        >
+                          {selectedBuilding.isHidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                          <span>{selectedBuilding.isHidden ? "Reveal" : "Hide"}</span>
+                        </button>
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
@@ -3748,7 +4259,7 @@ export default function MapInterface({
                       ...freshCity,
                       name: `${freshCity.name} - ${freshBld.name}`,
                       interiorMaps: freshBld.interiorMaps || insideBattleMapLocation.interiorMaps,
-                      activeInteriorMapId: freshBld.interiorMaps?.[0]?.id || insideBattleMapLocation.activeInteriorMapId
+                      activeInteriorMapId: freshBld.activeInteriorMapId || freshBld.interiorMaps?.[0]?.id || insideBattleMapLocation.activeInteriorMapId
                     };
                   }
                   return insideBattleMapLocation;
@@ -3760,6 +4271,8 @@ export default function MapInterface({
           partyLocationId={campaignState.partyLocationId}
           isDmMode={isDmMode}
           onToggleDmMode={() => setIsDmMode((prev) => !prev)}
+          followDm={followDm}
+          onToggleFollowDm={onToggleFollowDm}
           onClose={() => {
             setInsideBattleMapLocation(null);
             setInsideBattleMapBuildingId(null);

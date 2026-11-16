@@ -76,6 +76,36 @@ export default function InitiativeOrder({
   // Quick Party selector drawer
   const [isPartyPickerOpen, setIsPartyPickerOpen] = useState<boolean>(false);
 
+  // Inline confirmation state for Clear All (replaces disallowed window.confirm)
+  const [confirmClearAll, setConfirmClearAll] = useState<boolean>(false);
+
+  // Sync incoming server/WebSocket initiative updates when another browser updates encounter state
+  useEffect(() => {
+    if (savedInitiativeOrder !== undefined) {
+      setCombatants(savedInitiativeOrder);
+      try {
+        localStorage.setItem("aethelgard_initiative", JSON.stringify(savedInitiativeOrder));
+      } catch {
+        // ignore
+      }
+      if (savedInitiativeOrder.length === 0) {
+        setConfirmClearAll(false);
+      }
+    }
+  }, [savedInitiativeOrder]);
+
+  useEffect(() => {
+    if (typeof savedRound === "number") {
+      setRound(savedRound);
+    }
+  }, [savedRound]);
+
+  useEffect(() => {
+    if (typeof savedTurnIndex === "number") {
+      setCurrentTurnIndex(savedTurnIndex);
+    }
+  }, [savedTurnIndex]);
+
   // Calculate DEX modifier helper
   const getDexModifier = (char: Character): number => {
     const dex = char.stats?.dexterity ?? 10;
@@ -275,15 +305,14 @@ export default function InitiativeOrder({
     syncInitiative(updated, round, nextTurn);
   };
 
-  // Clear entire encounter
+  // Clear entire encounter (confirmed via inline toolbar controls)
   const handleClearAll = () => {
     if (combatants.length === 0) return;
-    if (window.confirm("Clear all combatants from the Initiative Order?")) {
-      setCombatants([]);
-      setRound(1);
-      setCurrentTurnIndex(0);
-      syncInitiative([], 1, 0);
-    }
+    setCombatants([]);
+    setRound(1);
+    setCurrentTurnIndex(0);
+    setConfirmClearAll(false);
+    syncInitiative([], 1, 0);
   };
 
   // Advance turn
@@ -481,13 +510,32 @@ export default function InitiativeOrder({
           </button>
 
           {combatants.length > 0 && (
-            <button
-              onClick={handleClearAll}
-              className="p-1.5 text-slate-500 hover:text-red-400 rounded hover:bg-red-950/20 transition-all cursor-pointer"
-              title="Clear entire encounter"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-            </button>
+            confirmClearAll ? (
+              <div className="flex items-center space-x-1 bg-red-950/60 border border-red-500/40 rounded px-1.5 py-0.5">
+                <button
+                  onClick={handleClearAll}
+                  className="px-1.5 py-0.5 bg-red-600 hover:bg-red-500 text-white rounded text-3xs font-mono font-bold uppercase cursor-pointer transition-colors"
+                  title="Confirm clearing all combatants"
+                >
+                  Clear All
+                </button>
+                <button
+                  onClick={() => setConfirmClearAll(false)}
+                  className="px-1.5 py-0.5 text-slate-300 hover:text-white text-3xs font-mono uppercase cursor-pointer"
+                  title="Cancel"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmClearAll(true)}
+                className="p-1.5 text-slate-500 hover:text-red-400 rounded hover:bg-red-950/20 transition-all cursor-pointer"
+                title="Clear entire encounter"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            )
           )}
         </div>
       </div>

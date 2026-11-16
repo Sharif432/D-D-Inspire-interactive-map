@@ -14,6 +14,7 @@ import {
   Move, 
   ZoomIn, 
   ZoomOut, 
+  Maximize2,
   Eye, 
   EyeOff, 
   RotateCcw, 
@@ -42,6 +43,8 @@ interface SiteBattleMapModalProps {
   partyLocationId: string;
   isDmMode?: boolean;
   onToggleDmMode?: () => void;
+  followDm?: boolean;
+  onToggleFollowDm?: () => void;
   savedImages?: ExtractedCampaignImage[];
   onClose: () => void;
   onSaveBattleMaps: (locationId: string, interiorMaps: SiteBattleMap[], activeInteriorMapId: string, buildingId?: string) => Promise<void>;
@@ -114,6 +117,8 @@ export default function SiteBattleMapModal({
   partyLocationId,
   isDmMode: externalDmMode,
   onToggleDmMode,
+  followDm = true,
+  onToggleFollowDm,
   savedImages = [],
   onClose,
   onSaveBattleMaps,
@@ -183,10 +188,19 @@ export default function SiteBattleMapModal({
   const [newMapRows, setNewMapRows] = useState(10);
   const [newMapPresetId, setNewMapPresetId] = useState("cavern");
 
-  // Zoom scale (supports 25% up to 350% for up to 100x100 grids)
+  // Zoom & Pan states (supports 25% up to 400% + smooth drag, wheel & pinch)
   const [zoom, setZoom] = useState(1);
+  const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isDraggingMap, setIsDraggingMap] = useState(false);
+  const [viewportSize, setViewportSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [hoverCell, setHoverCell] = useState<{ x: number; y: number } | null>(null);
   const gridContainerRef = useRef<HTMLDivElement>(null);
+  const battleViewportRef = useRef<HTMLDivElement>(null);
+  const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
+  const didDragMapRef = useRef<boolean>(false);
+  const touchDistanceRef = useRef<number | null>(null);
+  const lastAutoFittedKeyRef = useRef<string>("");
 
   // Battle Map Fit Mode (Contain vs Cover)
   const [battleMapFitMode, setBattleMapFitMode] = useState<"contain" | "cover">("contain");
@@ -206,6 +220,46 @@ export default function SiteBattleMapModal({
       setLocalDmMode((p) => !p);
     }
   };
+
+  // Sync rooms, tokens, grid dimensions, and battle fog from real-time server updates
+  useEffect(() => {
+    if (location.interiorMaps && location.interiorMaps.length > 0) {
+      setInteriorMaps(location.interiorMaps);
+      const activeStillExists = location.interiorMaps.some((m) => m.id === activeMapId);
+      const nextId = activeStillExists
+        ? activeMapId
+        : (location.activeInteriorMapId && location.interiorMaps.some((m) => m.id === location.activeInteriorMapId)
+            ? location.activeInteriorMapId
+            : location.interiorMaps[0].id);
+      if (nextId !== activeMapId) {
+        setActiveMapId(nextId);
+      }
+      if (!isSettingsOpen) {
+        const target = location.interiorMaps.find((m) => m.id === nextId) || location.interiorMaps[0];
+        if (target) {
+          setEditName(target.name);
+          setEditCols(target.gridCols);
+          setEditRows(target.gridRows);
+          setEditShowGrid(target.showGrid);
+        }
+      }
+    }
+  }, [location.interiorMaps]);
+
+  // Follow DM's room/chamber switch in real time (when Player Follow is enabled or when initial sync arrives)
+  useEffect(() => {
+    if (
+      (effectiveDmMode || followDm) &&
+      location.activeInteriorMapId &&
+      location.activeInteriorMapId !== activeMapId &&
+      location.interiorMaps?.some((m) => m.id === location.activeInteriorMapId)
+    ) {
+      setActiveMapId(location.activeInteriorMapId);
+      setSelectedTokenId(null);
+      setRulerStart(null);
+      setRulerEnd(null);
+    }
+  }, [location.activeInteriorMapId, location.interiorMaps, followDm, effectiveDmMode]);
 
   const [isFogToolbarOpen, setIsFogToolbarOpen] = useState<boolean>(false);
   const [fogBrushMode, setFogBrushMode] = useState<"off" | "reveal" | "hide">("off");
@@ -262,6 +316,163 @@ export default function SiteBattleMapModal({
   };
 
   const gridAspect = activeMap.gridCols / activeMap.gridRows;
+  const maxDim = Math.max(activeMap.gridCols, activeMap.gridRows);
+  const cellPx = maxDim <= 20 ? 56 : Math.max(16, Math.floor(1120 / maxDim));
+  const boardWidth = activeMap.gridCols * cellPx;
+  const boardHeight = activeMap.gridRows * cellPx;
+  const gridLineColor = activeMap.gridColor || "rgba(255, 255, 255, 0.18)";
+  const tokenPx = Math.max(12, Math.round(cellPx * 0.72));
+
+  const computeFitZoom = (vw: number, vh: number, bw: number, bh: number) => {
+    if (vw <= 0 || vh <= 0 || bw <= 0 || bh <= 0) return 1;
+    const pad = 24;
+    const scale = Math.min((vw - pad) / bw, (vh - pad) / bh);
+    return Math.min(2.0, Math.max(0.25, parseFloat(scale.toFixed(2))));
+  };
+
+  const handleFitToScreen = () => {
+    const nextZoom = computeFitZoom(viewportSize.width, viewportSize.height, boardWidth, boardHeight);
+    setZoom(nextZoom);
+    setPanOffset({ x: 0, y: 0 });
+  };
+
+  // Observe battle canvas viewport size so it always fits any window/screen size cleanly
+  useEffect(() => {
+    const el = battleViewportRef.current;
+    if (!el) return;
+    const updateSize = () => {
+      const rect = el.getBoundingClientRect();
+      setViewportSize({ width: Math.floor(rect.width), height: Math.floor(rect.height) });
+    };
+    updateSize();
+    const ro = new ResizeObserver(updateSize);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Auto-fit tactical grid into viewport on initial open, room switch, or grid size change
+  useEffect(() => {
+    if (viewportSize.width <= 0 || viewportSize.height <= 0) return;
+    const fitKey = `${activeMap.id}:${boardWidth}x${boardHeight}`;
+    if (lastAutoFittedKeyRef.current !== fitKey) {
+      lastAutoFittedKeyRef.current = fitKey;
+      const fitZoom = computeFitZoom(viewportSize.width, viewportSize.height, boardWidth, boardHeight);
+      setZoom(fitZoom);
+      setPanOffset({ x: 0, y: 0 });
+    }
+  }, [activeMap.id, boardWidth, boardHeight, viewportSize.width, viewportSize.height]);
+
+  // Non-passive wheel listener for smooth mouse-wheel zoom on tactical battle grid
+  useEffect(() => {
+    const el = battleViewportRef.current;
+    if (!el) return;
+    const handleNativeWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
+      setZoom((prev) => Math.min(4.0, Math.max(0.25, parseFloat((prev * zoomFactor).toFixed(2)))));
+    };
+    el.addEventListener("wheel", handleNativeWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleNativeWheel);
+  }, []);
+
+  // Reliable global mouseup cleanup when panning
+  useEffect(() => {
+    if (!isDraggingMap) return;
+    const handleGlobalMouseUp = () => {
+      setIsDraggingMap(false);
+      pointerDownPosRef.current = null;
+    };
+    window.addEventListener("mouseup", handleGlobalMouseUp);
+    return () => window.removeEventListener("mouseup", handleGlobalMouseUp);
+  }, [isDraggingMap]);
+
+  const handleBattleMouseDown = (e: React.MouseEvent) => {
+    // Allow DM Fog Brush painting with left button; middle-click always pans
+    if (effectiveDmMode && activeMap.fogOfWar?.enabled && fogBrushMode !== "off" && e.button === 0) {
+      return;
+    }
+    if (e.button !== 0 && e.button !== 1) return;
+    if (e.button === 1) e.preventDefault();
+    setIsDraggingMap(true);
+    didDragMapRef.current = false;
+    pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
+    dragStartRef.current = { x: e.clientX - panOffset.x, y: e.clientY - panOffset.y };
+  };
+
+  const handleBattleMouseMove = (e: React.MouseEvent) => {
+    if (!isDraggingMap) return;
+    if (pointerDownPosRef.current) {
+      const moved = Math.hypot(
+        e.clientX - pointerDownPosRef.current.x,
+        e.clientY - pointerDownPosRef.current.y
+      );
+      if (moved > 5) {
+        didDragMapRef.current = true;
+      }
+    }
+    setPanOffset({
+      x: e.clientX - dragStartRef.current.x,
+      y: e.clientY - dragStartRef.current.y
+    });
+  };
+
+  const handleBattleMouseUp = () => {
+    setIsDraggingMap(false);
+    pointerDownPosRef.current = null;
+  };
+
+  const handleBattleTouchStart = (e: React.TouchEvent) => {
+    if (effectiveDmMode && activeMap.fogOfWar?.enabled && fogBrushMode !== "off" && e.touches.length === 1) {
+      return;
+    }
+    if (e.touches.length === 1) {
+      setIsDraggingMap(true);
+      didDragMapRef.current = false;
+      pointerDownPosRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      dragStartRef.current = {
+        x: e.touches[0].clientX - panOffset.x,
+        y: e.touches[0].clientY - panOffset.y
+      };
+    } else if (e.touches.length === 2) {
+      setIsDraggingMap(false);
+      didDragMapRef.current = true;
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      touchDistanceRef.current = Math.hypot(dx, dy);
+    }
+  };
+
+  const handleBattleTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length === 1 && isDraggingMap) {
+      if (pointerDownPosRef.current) {
+        const moved = Math.hypot(
+          e.touches[0].clientX - pointerDownPosRef.current.x,
+          e.touches[0].clientY - pointerDownPosRef.current.y
+        );
+        if (moved > 5) {
+          didDragMapRef.current = true;
+        }
+      }
+      setPanOffset({
+        x: e.touches[0].clientX - dragStartRef.current.x,
+        y: e.touches[0].clientY - dragStartRef.current.y
+      });
+    } else if (e.touches.length === 2 && touchDistanceRef.current !== null) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const newDistance = Math.hypot(dx, dy);
+      const ratio = newDistance / touchDistanceRef.current;
+      setZoom((prev) => Math.min(4.0, Math.max(0.25, parseFloat((prev * ratio).toFixed(2)))));
+      touchDistanceRef.current = newDistance;
+    }
+  };
+
+  const handleBattleTouchEnd = () => {
+    setIsDraggingMap(false);
+    touchDistanceRef.current = null;
+    pointerDownPosRef.current = null;
+  };
 
   const isCellVisibleToPlayers = (cIdx: number, rIdx: number) => {
     if (effectiveDmMode) return true;
@@ -592,10 +803,10 @@ export default function SiteBattleMapModal({
     : undefined;
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex flex-col p-2 md:p-5 text-slate-200 overflow-hidden font-sans select-none animate-in fade-in duration-200">
+    <div className="fixed inset-0 z-50 h-[100dvh] max-h-[100dvh] bg-black/90 backdrop-blur-md flex flex-col p-2 md:p-4 text-slate-200 overflow-hidden font-sans select-none animate-in fade-in duration-200">
       
       {/* TOP HEADER COMMAND BAR */}
-      <div className="bg-[#0f1117] border border-white/10 rounded-2xl p-3 md:p-4 mb-3 flex flex-wrap items-center justify-between gap-3 shadow-2xl shrink-0">
+      <div className="bg-[#0f1117] border border-white/10 rounded-2xl p-2.5 md:p-3.5 mb-2.5 flex flex-wrap items-center justify-between gap-2.5 shadow-2xl shrink-0">
         
         {/* Left: Multi-level Breadcrumbs & Location Identification */}
         <div className="flex items-center space-x-3">
@@ -677,6 +888,21 @@ export default function SiteBattleMapModal({
           >
             <span>{effectiveDmMode ? "🎭 DM View" : "🛡️ Player View"}</span>
           </button>
+
+          {/* Follow DM Toggle in Player View */}
+          {!effectiveDmMode && onToggleFollowDm && (
+            <button
+              onClick={onToggleFollowDm}
+              className={`px-2.5 py-1.5 rounded-lg text-2xs font-mono font-bold transition-all cursor-pointer flex items-center gap-1 border ${
+                followDm
+                  ? "bg-emerald-950/70 text-emerald-300 border-emerald-500/50"
+                  : "bg-[#1a1c28] text-slate-400 border-white/10 hover:text-white"
+              }`}
+              title="Automatically follow the DM when they switch battle chambers or maps"
+            >
+              <span>{followDm ? "📡 Follow DM: ON" : "📡 Follow DM: OFF"}</span>
+            </button>
+          )}
 
           {/* Fog of War DM Button */}
           {effectiveDmMode && (
@@ -857,7 +1083,7 @@ export default function SiteBattleMapModal({
       <div className="flex-1 flex flex-col lg:flex-row gap-3 min-h-0 overflow-hidden relative">
         
         {/* LEFT / CENTER: THE INTERACTIVE TACTICAL COMBAT GRID CANVAS */}
-        <div className="flex-1 bg-[#0a0c10] border border-white/10 rounded-2xl overflow-hidden relative shadow-inner flex flex-col">
+        <div className="flex-1 min-h-0 bg-[#0a0c10] border border-white/10 rounded-2xl overflow-hidden relative shadow-inner flex flex-col">
           
           {/* Canvas Floating Overlay Controls (Tools, Zoom, Ruler distance) */}
           <div className="absolute top-3 left-3 z-30 flex items-center space-x-2 bg-[#0f1117]/90 backdrop-blur border border-white/10 p-1.5 rounded-xl shadow-lg">
@@ -913,7 +1139,7 @@ export default function SiteBattleMapModal({
               <Grid className="w-3.5 h-3.5" />
             </button>
 
-            {/* Zoom Controls (25% - 350%) */}
+            {/* Zoom & Fit Controls (25% - 400%) */}
             <div className="flex items-center space-x-1 border-l border-white/10 pl-2">
               <button
                 onClick={() => setZoom(z => Math.max(0.25, parseFloat((z - 0.15).toFixed(2))))}
@@ -922,15 +1148,27 @@ export default function SiteBattleMapModal({
               >
                 <ZoomOut className="w-3 h-3" />
               </button>
-              <span className="text-3xs font-mono text-slate-400 w-9 text-center">
-                {Math.round(zoom * 100)}%
-              </span>
               <button
-                onClick={() => setZoom(z => Math.min(3.5, parseFloat((z + 0.15).toFixed(2))))}
+                onClick={handleFitToScreen}
+                className="text-3xs font-mono text-amber-400 hover:text-amber-300 w-10 text-center cursor-pointer font-bold"
+                title="Click to Fit & Center Battle Map to Screen"
+              >
+                {Math.round(zoom * 100)}%
+              </button>
+              <button
+                onClick={() => setZoom(z => Math.min(4.0, parseFloat((z + 0.15).toFixed(2))))}
                 className="p-1 hover:bg-white/10 text-slate-400 hover:text-white rounded cursor-pointer"
                 title="Zoom In"
               >
                 <ZoomIn className="w-3 h-3" />
+              </button>
+              <button
+                onClick={handleFitToScreen}
+                className="px-1.5 py-0.5 hover:bg-white/10 text-slate-300 hover:text-amber-300 rounded text-3xs font-mono flex items-center gap-1 cursor-pointer border border-white/10"
+                title="Fit Battle Map to Screen"
+              >
+                <Maximize2 className="w-2.5 h-2.5" />
+                <span>Fit</span>
               </button>
             </div>
 
@@ -973,16 +1211,26 @@ export default function SiteBattleMapModal({
             )}
           </div>
 
-          {/* SCROLLABLE MAP & TACTICAL GRID AREA */}
-          <div className="flex-1 overflow-auto p-4 flex items-center justify-center custom-scrollbar">
-            {(() => {
-              const maxDim = Math.max(activeMap.gridCols, activeMap.gridRows);
-              const cellPx = maxDim <= 20 ? 56 : Math.max(16, Math.floor(1120 / maxDim));
-              const boardWidth = activeMap.gridCols * cellPx;
-              const boardHeight = activeMap.gridRows * cellPx;
-              const gridLineColor = activeMap.gridColor || "rgba(255, 255, 255, 0.18)";
-              const tokenPx = Math.max(12, Math.round(cellPx * 0.72));
+          {/* Floating Pan/Zoom Helper Badge */}
+          <div className="absolute bottom-3 left-3 z-30 bg-[#0f111a]/85 backdrop-blur border border-white/10 rounded-lg px-2.5 py-1 text-4xs font-mono text-slate-400 pointer-events-none shadow-md">
+            Drag to pan • Wheel / pinch to zoom
+          </div>
 
+          {/* PANNABLE & ZOOMABLE TACTICAL GRID VIEWPORT */}
+          <div
+            ref={battleViewportRef}
+            onMouseDown={handleBattleMouseDown}
+            onMouseMove={handleBattleMouseMove}
+            onMouseUp={handleBattleMouseUp}
+            onTouchStart={handleBattleTouchStart}
+            onTouchMove={handleBattleTouchMove}
+            onTouchEnd={handleBattleTouchEnd}
+            style={{ touchAction: "none" }}
+            className={`flex-1 min-h-0 relative overflow-hidden flex items-center justify-center select-none ${
+              isDraggingMap ? "cursor-grabbing" : "cursor-grab"
+            }`}
+          >
+            {(() => {
               const getGridCoordsFromPointer = (clientX: number, clientY: number) => {
                 const el = gridContainerRef.current;
                 if (!el) return null;
@@ -996,9 +1244,9 @@ export default function SiteBattleMapModal({
               return (
                 <div
                   style={{
-                    transform: `scale(${zoom})`,
+                    transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoom})`,
                     transformOrigin: "center center",
-                    transition: "transform 0.15s ease-out"
+                    transition: isDraggingMap ? "none" : "transform 0.08s ease-out"
                   }}
                   className="relative shadow-2xl rounded-xl overflow-hidden border border-white/20 shrink-0"
                 >
@@ -1006,10 +1254,15 @@ export default function SiteBattleMapModal({
                   <div
                     ref={gridContainerRef}
                     onClick={(e) => {
+                      if (didDragMapRef.current) {
+                        didDragMapRef.current = false;
+                        return;
+                      }
                       const coords = getGridCoordsFromPointer(e.clientX, e.clientY);
                       if (coords) handleCellClick(coords.x, coords.y);
                     }}
                     onMouseMove={(e) => {
+                      if (isDraggingMap) return;
                       const coords = getGridCoordsFromPointer(e.clientX, e.clientY);
                       setHoverCell(coords);
                     }}
@@ -1023,7 +1276,7 @@ export default function SiteBattleMapModal({
                       width: `${boardWidth}px`,
                       height: `${boardHeight}px`
                     }}
-                    className="relative cursor-pointer"
+                    className={`relative ${isDraggingMap ? "cursor-grabbing" : "cursor-pointer"}`}
                   >
                     {/* Vignette / ambient battle lighting */}
                     <div className="absolute inset-0 bg-black/20 pointer-events-none" />
@@ -1174,7 +1427,7 @@ export default function SiteBattleMapModal({
           </div>
 
           {/* BOTTOM TRAY: PARTY CHARACTERS & COMBAT SPAWN DECK */}
-          <div className="p-3 bg-[#0d0f15] border-t border-white/10 flex flex-wrap items-center justify-between gap-3 shrink-0">
+          <div className="p-2 sm:p-2.5 bg-[#0d0f15] border-t border-white/10 flex flex-wrap items-center justify-between gap-2 shrink-0 max-h-[22vh] overflow-y-auto">
             
             {/* Party heroes for placement */}
             <div className="flex items-center space-x-2 overflow-x-auto max-w-full py-0.5">
@@ -1264,7 +1517,7 @@ export default function SiteBattleMapModal({
         </div>
 
         {/* RIGHT / SIDE PANEL: TACTICAL TOKEN INSPECTOR & CHAMBER REPORT */}
-        <div className="w-full lg:w-80 bg-[#0f1117] border border-white/10 rounded-2xl p-4 flex flex-col justify-between shrink-0 space-y-4 shadow-xl overflow-y-auto">
+        <div className="w-full lg:w-80 max-h-[32vh] lg:max-h-full min-h-0 bg-[#0f1117] border border-white/10 rounded-2xl p-3 sm:p-4 flex flex-col justify-between shrink-0 space-y-3 shadow-xl overflow-y-auto">
           
           <div className="space-y-4">
             

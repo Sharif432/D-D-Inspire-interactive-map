@@ -8,13 +8,15 @@ import {
   InitiativeCombatant, 
   SiteBattleMap, 
   CampaignLocation,
-  FogOfWarState
+  FogOfWarState,
+  LiveViewState
 } from "./types";
 import { 
   BookOpen, 
   Compass, 
   Dices, 
   Plus, 
+  Minus,
   Trash2, 
   RefreshCw, 
   Scroll, 
@@ -41,6 +43,33 @@ import StandaloneModal from "./components/StandaloneModal";
 import { extractCampaignImages, processUploadedImage } from "./utils/imageUtils";
 import { motion, AnimatePresence } from "motion/react";
 
+const STATUS_EFFECT_PRESETS: { name: string; colorClass: string; dotClass: string }[] = [
+  { name: "Poisoned", colorClass: "bg-emerald-950/90 text-emerald-300 border-emerald-500/50", dotClass: "bg-emerald-400" },
+  { name: "Prone", colorClass: "bg-amber-950/90 text-amber-300 border-amber-500/50", dotClass: "bg-amber-400" },
+  { name: "Stunned", colorClass: "bg-yellow-950/90 text-yellow-300 border-yellow-500/50", dotClass: "bg-yellow-400" },
+  { name: "Blinded", colorClass: "bg-slate-800/95 text-slate-200 border-slate-400/50", dotClass: "bg-slate-300" },
+  { name: "Charmed", colorClass: "bg-pink-950/90 text-pink-300 border-pink-500/50", dotClass: "bg-pink-400" },
+  { name: "Frightened", colorClass: "bg-purple-950/90 text-purple-300 border-purple-500/50", dotClass: "bg-purple-400" },
+  { name: "Grappled", colorClass: "bg-orange-950/90 text-orange-300 border-orange-500/50", dotClass: "bg-orange-400" },
+  { name: "Paralyzed", colorClass: "bg-red-950/90 text-red-300 border-red-500/50", dotClass: "bg-red-400" },
+  { name: "Restrained", colorClass: "bg-orange-950/80 text-amber-200 border-amber-400/50", dotClass: "bg-amber-300" },
+  { name: "Incapacitated", colorClass: "bg-rose-950/90 text-rose-300 border-rose-500/50", dotClass: "bg-rose-400" },
+  { name: "Invisible", colorClass: "bg-cyan-950/90 text-cyan-300 border-cyan-500/50", dotClass: "bg-cyan-400" },
+  { name: "Concentrating", colorClass: "bg-blue-950/90 text-blue-300 border-blue-500/50", dotClass: "bg-blue-400" }
+];
+
+function getStatusBadgeStyle(statusName: string) {
+  const found = STATUS_EFFECT_PRESETS.find(
+    (s) => s.name.toLowerCase() === statusName.trim().toLowerCase()
+  );
+  if (found) return found;
+  return {
+    name: statusName,
+    colorClass: "bg-indigo-950/90 text-indigo-300 border-indigo-500/50",
+    dotClass: "bg-indigo-400"
+  };
+}
+
 export default function App() {
   const [state, setState] = useState<CampaignState | null>(null);
   const [selectedCharacterId, setSelectedCharacterId] = useState<string>("valerius");
@@ -49,6 +78,79 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isStandaloneModalOpen, setIsStandaloneModalOpen] = useState(false);
+
+  // Per-browser / per-tab DM vs Player role & Follow-DM state (isolated via sessionStorage)
+  const [isDmMode, setIsDmMode] = useState<boolean>(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const roleParam = params.get("role");
+      if (roleParam === "player") {
+        sessionStorage.setItem("dnd_browser_role", "player");
+        return false;
+      }
+      if (roleParam === "dm") {
+        sessionStorage.setItem("dnd_browser_role", "dm");
+        return true;
+      }
+      const saved = sessionStorage.getItem("dnd_browser_role");
+      if (saved === "player") return false;
+      if (saved === "dm") return true;
+    } catch {
+      // Ignore storage access failures
+    }
+    return true;
+  });
+
+  const [followDm, setFollowDm] = useState<boolean>(() => {
+    try {
+      const saved = sessionStorage.getItem("dnd_follow_dm");
+      if (saved === "false") return false;
+    } catch {
+      // Ignore
+    }
+    return true;
+  });
+
+  const handleSetIsDmMode = (nextDm: boolean) => {
+    setIsDmMode(nextDm);
+    try {
+      sessionStorage.setItem("dnd_browser_role", nextDm ? "dm" : "player");
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleToggleFollowDm = () => {
+    setFollowDm((prev) => {
+      const next = !prev;
+      try {
+        sessionStorage.setItem("dnd_follow_dm", next ? "true" : "false");
+      } catch {
+        // Ignore
+      }
+      return next;
+    });
+  };
+
+  const lastVersionRef = useRef<number>(0);
+
+  const applyIncomingCampaign = (nextCampaign: CampaignState | null | undefined, force = false) => {
+    if (!nextCampaign) return;
+    const incomingVer = typeof nextCampaign.stateVersion === "number" ? nextCampaign.stateVersion : 0;
+    if (!force && incomingVer > 0 && incomingVer < lastVersionRef.current) {
+      return;
+    }
+    if (incomingVer > lastVersionRef.current || force) {
+      lastVersionRef.current = incomingVer;
+    }
+    setState(nextCampaign);
+    if (nextCampaign.campaignName) {
+      setCampaignNameInput((prev) => prev || nextCampaign.campaignName || "");
+    }
+    if (nextCampaign.partyName) {
+      setPartyNameInput((prev) => prev || nextCampaign.partyName || "");
+    }
+  };
 
   // Campaign & Party Metadata editing
   const [isEditingCampaignMeta, setIsEditingCampaignMeta] = useState(false);
@@ -74,6 +176,8 @@ export default function App() {
   });
   const charFileInputRef = useRef<HTMLInputElement>(null);
   const [characterToDelete, setCharacterToDelete] = useState<Character | null>(null);
+  const [statusPickerCharId, setStatusPickerCharId] = useState<string | null>(null);
+  const [customStatusInput, setCustomStatusInput] = useState("");
 
   // New Hero addition state
   const [isAddingHero, setIsAddingHero] = useState(false);
@@ -96,9 +200,8 @@ export default function App() {
       const res = await fetch("/api/campaign");
       if (!res.ok) throw new Error("Failed to fetch campaign data");
       const data = await res.json();
-      setState(data);
-      if (!campaignNameInput && data.campaignName) setCampaignNameInput(data.campaignName);
-      if (!partyNameInput && data.partyName) setPartyNameInput(data.partyName);
+      applyIncomingCampaign(data, showLoader);
+      setErrorMessage(null);
     } catch (err: any) {
       console.error(err);
       setErrorMessage("Error sync. Ensure backend is running.");
@@ -107,13 +210,68 @@ export default function App() {
     }
   };
 
-  // Poll state every 4.5 seconds for multi-device sync
+  // Real-time WebSocket sync across browsers + auto-reconnect + gentle fallback fetch
   useEffect(() => {
+    let isUnmounted = false;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
     fetchCampaign(true);
-    const interval = setInterval(() => {
+
+    const connectWs = () => {
+      if (isUnmounted) return;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${protocol}//${window.location.host}/ws/campaign`;
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch {
+        reconnectTimer = setTimeout(connectWs, 1500);
+        return;
+      }
+
+      ws.onmessage = (event) => {
+        if (isUnmounted) return;
+        try {
+          const msg = JSON.parse(event.data);
+          if ((msg?.type === "campaign:init" || msg?.type === "campaign:updated") && msg.campaign) {
+            applyIncomingCampaign(msg.campaign, msg.type === "campaign:init");
+            setIsLoading(false);
+          }
+        } catch {
+          // Ignore malformed WS messages
+        }
+      };
+
+      ws.onclose = () => {
+        if (isUnmounted) return;
+        reconnectTimer = setTimeout(connectWs, 1500);
+      };
+
+      ws.onerror = () => {
+        try {
+          ws?.close();
+        } catch {
+          // Ignore
+        }
+      };
+    };
+
+    connectWs();
+
+    const fallbackInterval = setInterval(() => {
       fetchCampaign(false);
-    }, 4500);
-    return () => clearInterval(interval);
+    }, 15000);
+
+    return () => {
+      isUnmounted = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      clearInterval(fallbackInterval);
+      try {
+        ws?.close();
+      } catch {
+        // Ignore
+      }
+    };
   }, []);
 
   // Update Campaign & Party Names
@@ -130,7 +288,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
         setIsEditingCampaignMeta(false);
       }
     } catch (err) {
@@ -147,8 +305,8 @@ export default function App() {
         body: JSON.stringify({ targetLocationId: locationId })
       });
       const data = await res.json();
-      if (data.success) {
-        setState(data.campaign);
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Move party failure:", err);
@@ -164,8 +322,8 @@ export default function App() {
         body: JSON.stringify({ locationId })
       });
       const data = await res.json();
-      if (data.success) {
-        setState(data.campaign);
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Toggle location state error:", err);
@@ -181,8 +339,8 @@ export default function App() {
         body: JSON.stringify(locData)
       });
       const data = await res.json();
-      if (data.success) {
-        setState(data.campaign);
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Creation err:", err);
@@ -204,7 +362,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Save battle maps error:", err);
@@ -228,10 +386,27 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Update fog of war error:", err);
+    }
+  };
+
+  // Broadcast DM active map/room/battle view across browsers
+  const handleUpdateLiveView = async (liveView: LiveViewState) => {
+    try {
+      const res = await fetch("/api/campaign/live-view", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(liveView)
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
+      }
+    } catch (err) {
+      console.error("Update live view error:", err);
     }
   };
 
@@ -245,7 +420,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Update region image failure:", err);
@@ -262,7 +437,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Update location error:", err);
@@ -279,7 +454,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Delete location error:", err);
@@ -296,7 +471,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Toggle boss slain error:", err);
@@ -313,7 +488,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Toggle hidden error:", err);
@@ -367,7 +542,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
         setEditingCharacter(null);
       }
     } catch (err) {
@@ -385,7 +560,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
         if (selectedCharacterId === charId && data.campaign.characters.length > 0) {
           setSelectedCharacterId(data.campaign.characters[0].id);
         }
@@ -395,6 +570,54 @@ export default function App() {
     } catch (err) {
       console.error("Delete character error:", err);
     }
+  };
+
+  // Persist quick status effect / exhaustion changes for a character
+  const persistQuickCharacterUpdate = async (updatedChar: Character) => {
+    setState((prev) =>
+      prev
+        ? {
+            ...prev,
+            characters: prev.characters.map((c) => (c.id === updatedChar.id ? updatedChar : c))
+          }
+        : prev
+    );
+    try {
+      const res = await fetch("/api/campaign/character", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updatedChar)
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
+      }
+    } catch (err) {
+      console.error("Quick character update error:", err);
+    }
+  };
+
+  const handleToggleStatusEffect = async (char: Character, rawEffect: string) => {
+    const clean = rawEffect.trim();
+    if (!clean) return;
+    const current = char.statusEffects || [];
+    const exists = current.some((s) => s.toLowerCase() === clean.toLowerCase());
+    const nextEffects = exists
+      ? current.filter((s) => s.toLowerCase() !== clean.toLowerCase())
+      : [...current, clean];
+    await persistQuickCharacterUpdate({
+      ...char,
+      statusEffects: nextEffects
+    });
+  };
+
+  const handleAdjustExhaustion = async (char: Character, nextLevel: number) => {
+    const clamped = Math.max(0, Math.min(6, nextLevel));
+    if (clamped === (char.exhaustionLevel || 0)) return;
+    await persistQuickCharacterUpdate({
+      ...char,
+      exhaustionLevel: clamped
+    });
   };
 
   // Character Avatar file upload (auto-optimized for portable JSON export)
@@ -448,8 +671,8 @@ export default function App() {
         body: JSON.stringify(customChar)
       });
       const data = await res.json();
-      if (data.success) {
-        setState(data.campaign);
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
         setSelectedCharacterId(customChar.id);
         setHeroName("");
         setHeroClass("");
@@ -479,8 +702,8 @@ export default function App() {
         })
       });
       const data = await res.json();
-      if (data.success) {
-        setState(data.campaign);
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
         setNewNoteTitle("");
         setNewNoteContent("");
       }
@@ -493,8 +716,8 @@ export default function App() {
     try {
       const res = await fetch(`/api/notes/${id}`, { method: "DELETE" });
       const data = await res.json();
-      if (data.success) {
-        setState(data.campaign);
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.error("Delete note error:", err);
@@ -532,7 +755,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success && data.campaign) {
-        setState(data.campaign);
+        applyIncomingCampaign(data.campaign);
       }
     } catch (err) {
       console.warn("Initiative save failure:", err);
@@ -578,10 +801,10 @@ export default function App() {
     : state.notes.filter(n => n.category === noteFilter);
 
   return (
-    <div className="min-h-screen bg-[#0c0e12] text-[#d1d5db] font-sans flex flex-col overflow-x-hidden selection:bg-amber-500 selection:text-black">
+    <div className="h-[100dvh] max-h-[100dvh] bg-[#0c0e12] text-[#d1d5db] font-sans flex flex-col overflow-hidden selection:bg-amber-500 selection:text-black">
       
       {/* HEADER BANNER - EDITABLE CAMPAIGN NAME & NAVIGATION */}
-      <header className="h-20 shrink-0 border-b border-white/10 bg-[#0f1117] flex items-center justify-between px-4 sm:px-6 lg:px-8 shadow-md">
+      <header className="h-16 sm:h-18 shrink-0 border-b border-white/10 bg-[#0f1117] flex items-center justify-between px-4 sm:px-6 lg:px-8 shadow-md">
         <div className="flex items-center gap-3 sm:gap-6 min-w-0">
           {/* Editable Campaign Title */}
           <div className="flex flex-col min-w-0">
@@ -637,7 +860,35 @@ export default function App() {
             </button>
           </div>
 
-          <div className="flex items-center gap-2.5 ml-2 sm:ml-4">
+          <div className="flex items-center gap-2 ml-2 sm:ml-4">
+            {/* Per-Browser DM / Player Role Switcher */}
+            <div className="hidden sm:flex items-center bg-[#151722] p-0.5 rounded-lg border border-white/10 text-[10px] font-mono">
+              <button
+                type="button"
+                onClick={() => handleSetIsDmMode(true)}
+                className={`px-2 py-1 rounded transition-all cursor-pointer ${
+                  isDmMode
+                    ? "bg-amber-500 text-black font-bold"
+                    : "text-slate-400 hover:text-white"
+                }`}
+                title="Use this browser as Dungeon Master (controls Fog of War and broadcasts active map)"
+              >
+                🎭 DM
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSetIsDmMode(false)}
+                className={`px-2 py-1 rounded transition-all cursor-pointer ${
+                  !isDmMode
+                    ? "bg-blue-600 text-white font-bold"
+                    : "text-slate-400 hover:text-white"
+                }`}
+                title="Use this browser as Player View (receives live Fog, Map, Room & Token updates)"
+              >
+                🛡️ Player
+              </button>
+            </div>
+
             <button
               onClick={() => setIsStandaloneModalOpen(true)}
               className="flex items-center space-x-1.5 px-3 py-1.5 bg-gradient-to-r from-amber-500/15 to-amber-600/10 hover:from-amber-500/25 hover:to-amber-600/20 border border-amber-500/40 hover:border-amber-400 text-amber-300 rounded-lg text-xs font-mono transition-all cursor-pointer shadow-sm"
@@ -647,11 +898,6 @@ export default function App() {
               <span className="hidden sm:inline font-bold">Save / Load (.json)</span>
               <span className="sm:hidden font-bold">Save</span>
             </button>
-
-            <div className="hidden lg:flex items-center gap-1 bg-emerald-950/40 border border-emerald-500/20 text-emerald-400 text-[10px] uppercase tracking-widest px-2.5 py-1 rounded-full font-mono font-semibold">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse inline-block" />
-              Auto-Sync
-            </div>
           </div>
         </div>
       </header>
@@ -660,10 +906,10 @@ export default function App() {
       <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
         
         {/* LEFT WORKSPACE SIDEBAR - THE D&D PARTY ROSTER (EASILY MODIFIABLE) */}
-        <aside className="w-full lg:w-80 shrink-0 border-r border-white/5 bg-[#0f1117] flex flex-col overflow-y-auto">
+        <aside className="w-full lg:w-80 shrink-0 max-h-[30vh] lg:max-h-full border-b lg:border-b-0 lg:border-r border-white/5 bg-[#0f1117] flex flex-col min-h-0 overflow-hidden">
           
           {/* Party list heading with Party Name editing */}
-          <div className="p-4 border-b border-white/5 bg-black/10 flex items-center justify-between">
+          <div className="p-3 sm:p-4 border-b border-white/5 bg-black/10 flex items-center justify-between shrink-0">
             <div className="flex items-center space-x-1.5 group cursor-pointer" onClick={() => setIsEditingCampaignMeta(true)}>
               <h2 className="text-[11px] uppercase tracking-widest text-amber-500 font-bold font-mono truncate max-w-[170px]">
                 {partyAllianceName}
@@ -764,7 +1010,7 @@ export default function App() {
           </AnimatePresence>
 
           {/* Character Profiles list with easy Modification buttons */}
-          <div className="p-4 space-y-3.5 flex-1">
+          <div className="p-3 sm:p-4 space-y-3 flex-1 min-h-0 overflow-y-auto">
             {state.characters.map((char) => {
               const isSelected = char.id === selectedCharacterId;
               const hpPercent = Math.min(100, Math.floor((char.hp.current / char.hp.max) * 100));
@@ -804,22 +1050,211 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Character health bars */}
+                  {/* Character health bars, status effects & exhaustion */}
                   {char.id !== "dm" && (
-                    <div className="mt-2.5 space-y-1">
-                      <div className="flex justify-between text-[9px] font-mono text-slate-400">
-                        <span className="flex items-center gap-1">
-                          <Heart className="w-3 h-3 text-red-400" />
-                          Vitality
-                        </span>
-                        <span className="font-bold text-slate-200">{char.hp.current} / {char.hp.max} HP</span>
+                    <div className="mt-2.5 space-y-2">
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-[9px] font-mono text-slate-400">
+                          <span className="flex items-center gap-1">
+                            <Heart className="w-3 h-3 text-red-400" />
+                            Vitality
+                          </span>
+                          <span className="font-bold text-slate-200">{char.hp.current} / {char.hp.max} HP</span>
+                        </div>
+                        <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
+                          <div 
+                            className={`h-full transition-all ${hpPercent > 50 ? "bg-amber-500" : hpPercent > 20 ? "bg-orange-500" : "bg-red-500"}`}
+                            style={{ width: `${hpPercent}%` }}
+                          />
+                        </div>
                       </div>
-                      <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
-                        <div 
-                          className={`h-full transition-all ${hpPercent > 50 ? "bg-amber-500" : hpPercent > 20 ? "bg-orange-500" : "bg-red-500"}`}
-                          style={{ width: `${hpPercent}%` }}
-                        />
+
+                      {/* Status Effects Badges & Quick-Add Trigger */}
+                      <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                        {(char.statusEffects || []).map((effect) => {
+                          const style = getStatusBadgeStyle(effect);
+                          return (
+                            <button
+                              key={effect}
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleToggleStatusEffect(char, effect);
+                              }}
+                              title={`Remove ${effect}`}
+                              className={`px-1.5 py-0.5 rounded border text-[9px] font-mono font-semibold inline-flex items-center gap-1 transition-all hover:brightness-110 cursor-pointer ${style.colorClass}`}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${style.dotClass}`} />
+                              <span>{effect}</span>
+                              <X className="w-2.5 h-2.5 opacity-70" />
+                            </button>
+                          );
+                        })}
+
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setStatusPickerCharId(statusPickerCharId === char.id ? null : char.id);
+                            setCustomStatusInput("");
+                          }}
+                          className={`px-1.5 py-0.5 rounded border text-[9px] font-mono inline-flex items-center gap-0.5 transition-all cursor-pointer ${
+                            statusPickerCharId === char.id
+                              ? "bg-amber-500/20 text-amber-300 border-amber-500/50 font-bold"
+                              : "bg-white/5 hover:bg-white/10 text-slate-400 hover:text-amber-300 border-white/10"
+                          }`}
+                          title="Quick-add or toggle status effects"
+                        >
+                          <Plus className="w-2.5 h-2.5" />
+                          <span>Status</span>
+                        </button>
                       </div>
+
+                      {/* Quick-Add Status Effects Tray */}
+                      {statusPickerCharId === char.id && (
+                        <div
+                          onClick={(e) => e.stopPropagation()}
+                          className="p-2 rounded-lg bg-[#0b0d13] border border-amber-500/35 space-y-2 shadow-inner"
+                        >
+                          <div className="flex items-center justify-between text-[9px] font-mono uppercase tracking-wider text-slate-400">
+                            <span className="text-amber-400 font-bold">Quick Status Effects</span>
+                            <button
+                              type="button"
+                              onClick={() => setStatusPickerCharId(null)}
+                              className="text-slate-400 hover:text-white cursor-pointer"
+                            >
+                              Done
+                            </button>
+                          </div>
+
+                          <div className="flex flex-wrap gap-1">
+                            {STATUS_EFFECT_PRESETS.map((preset) => {
+                              const isActive = (char.statusEffects || []).some(
+                                (s) => s.toLowerCase() === preset.name.toLowerCase()
+                              );
+                              return (
+                                <button
+                                  key={preset.name}
+                                  type="button"
+                                  onClick={() => handleToggleStatusEffect(char, preset.name)}
+                                  className={`px-1.5 py-0.5 rounded border text-[9px] font-mono inline-flex items-center gap-1 transition-all cursor-pointer ${
+                                    isActive
+                                      ? `${preset.colorClass} ring-1 ring-white/40 font-bold`
+                                      : "bg-[#151824] hover:bg-[#1e2233] text-slate-300 border-white/10"
+                                  }`}
+                                >
+                                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${preset.dotClass}`} />
+                                  <span>{preset.name}</span>
+                                  {isActive && <Check className="w-2.5 h-2.5" />}
+                                </button>
+                              );
+                            })}
+                          </div>
+
+                          <form
+                            onSubmit={(e) => {
+                              e.preventDefault();
+                              if (!customStatusInput.trim()) return;
+                              handleToggleStatusEffect(char, customStatusInput.trim());
+                              setCustomStatusInput("");
+                            }}
+                            className="flex gap-1 pt-0.5"
+                          >
+                            <input
+                              type="text"
+                              placeholder="Custom effect..."
+                              value={customStatusInput}
+                              onChange={(e) => setCustomStatusInput(e.target.value)}
+                              className="flex-1 min-w-0 bg-[#151824] border border-white/10 text-slate-200 px-2 py-1 rounded text-[10px] font-mono focus:outline-none focus:border-amber-500"
+                            />
+                            <button
+                              type="submit"
+                              disabled={!customStatusInput.trim()}
+                              className="px-2 py-1 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-mono font-bold text-[9px] uppercase rounded cursor-pointer"
+                            >
+                              Add
+                            </button>
+                          </form>
+                        </div>
+                      )}
+
+                      {/* Adjustable Exhausted Points (0-6) */}
+                      {(() => {
+                        const exhaustion = Math.max(0, Math.min(6, char.exhaustionLevel || 0));
+                        return (
+                          <div
+                            onClick={(e) => e.stopPropagation()}
+                            className="flex items-center justify-between gap-2 bg-black/25 border border-white/5 rounded-lg px-2 py-1 text-[9px] font-mono"
+                          >
+                            <span
+                              className={`font-semibold tracking-wide ${
+                                exhaustion >= 4
+                                  ? "text-red-400"
+                                  : exhaustion >= 1
+                                  ? "text-amber-300"
+                                  : "text-slate-400"
+                              }`}
+                            >
+                              Exhausted
+                            </span>
+
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                disabled={exhaustion <= 0}
+                                onClick={() => handleAdjustExhaustion(char, exhaustion - 1)}
+                                className="w-4 h-4 rounded bg-white/5 hover:bg-white/15 disabled:opacity-30 border border-white/10 flex items-center justify-center text-slate-300 cursor-pointer"
+                                title="Decrease Exhausted level"
+                              >
+                                <Minus className="w-2.5 h-2.5" />
+                              </button>
+
+                              <div className="flex items-center gap-0.5 px-0.5" title={`Exhaustion ${exhaustion} / 6`}>
+                                {[1, 2, 3, 4, 5, 6].map((lvl) => {
+                                  const filled = lvl <= exhaustion;
+                                  return (
+                                    <button
+                                      key={lvl}
+                                      type="button"
+                                      onClick={() => handleAdjustExhaustion(char, lvl === exhaustion ? lvl - 1 : lvl)}
+                                      className={`w-2 h-2.5 rounded-[2px] border transition-colors cursor-pointer ${
+                                        filled
+                                          ? exhaustion >= 4
+                                            ? "bg-red-500 border-red-300"
+                                            : "bg-amber-500 border-amber-300"
+                                          : "bg-white/5 border-white/15 hover:border-amber-400/60"
+                                      }`}
+                                      title={`Set Exhausted to ${lvl === exhaustion ? lvl - 1 : lvl}`}
+                                    />
+                                  );
+                                })}
+                              </div>
+
+                              <button
+                                type="button"
+                                disabled={exhaustion >= 6}
+                                onClick={() => handleAdjustExhaustion(char, exhaustion + 1)}
+                                className="w-4 h-4 rounded bg-white/5 hover:bg-white/15 disabled:opacity-30 border border-white/10 flex items-center justify-center text-slate-300 cursor-pointer"
+                                title="Increase Exhausted level"
+                              >
+                                <Plus className="w-2.5 h-2.5" />
+                              </button>
+
+                              <span
+                                className={`ml-0.5 w-6 text-right font-bold ${
+                                  exhaustion >= 4
+                                    ? "text-red-400"
+                                    : exhaustion >= 1
+                                    ? "text-amber-300"
+                                    : "text-slate-500"
+                                }`}
+                              >
+                                {exhaustion}/6
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })()}
                     </div>
                   )}
 
@@ -864,7 +1299,7 @@ export default function App() {
           </div>
 
           {/* Quick Party Summary */}
-          <div className="p-4 border-t border-white/5 bg-[#12141d] text-2xs font-mono text-slate-400 flex items-center justify-between">
+          <div className="px-4 py-2.5 border-t border-white/5 bg-[#12141d] text-2xs font-mono text-slate-400 flex items-center justify-between shrink-0">
             <span>Alliance: {state.characters.length} Adventurers</span>
             <button
               onClick={() => setIsEditingCampaignMeta(true)}
@@ -877,11 +1312,16 @@ export default function App() {
         </aside>
 
         {/* CENTER COMPONENT - SWITCHABLE TAB TILES */}
-        <main className="flex-1 flex flex-col relative overflow-y-auto">
+        <main className="flex-1 flex flex-col min-h-0 relative overflow-hidden">
           {activeTab === "map" && (
-            <div className="flex-1 p-3 sm:p-4 lg:p-6 min-h-0 flex flex-col">
+            <div className="flex-1 p-2 sm:p-3 lg:p-4 min-h-0 flex flex-col overflow-hidden">
               <MapInterface
                 campaignState={state}
+                isDmMode={isDmMode}
+                onSetIsDmMode={handleSetIsDmMode}
+                followDm={followDm}
+                onToggleFollowDm={handleToggleFollowDm}
+                onUpdateLiveView={handleUpdateLiveView}
                 onMoveParty={handleMoveParty}
                 onToggleDiscovered={handleToggleDiscovered}
                 onCreateLocation={handleCreateLocation}
@@ -1018,7 +1458,7 @@ export default function App() {
           )}
 
           {activeTab === "journal" && (
-            <div className="flex-1 p-4 lg:p-8 flex flex-col space-y-6">
+            <div className="flex-1 p-4 lg:p-6 flex flex-col space-y-6 min-h-0 overflow-y-auto">
               <div className="flex flex-col md:flex-row gap-6">
                 
                 {/* Note Writer */}
@@ -1166,7 +1606,7 @@ export default function App() {
       </div>
 
       {/* FOOTER BAR */}
-      <footer className="h-10 border-t border-white/10 bg-[#0c0e12] px-6 flex items-center justify-between text-[10px] font-mono text-slate-500 select-none shrink-0">
+      <footer className="h-8 sm:h-9 border-t border-white/10 bg-[#0c0e12] px-4 sm:px-6 flex items-center justify-between text-[10px] font-mono text-slate-500 select-none shrink-0">
         <div className="flex items-center space-x-4">
           <span className="flex items-center gap-1">
             <Clock className="w-3 h-3 text-amber-500" />
@@ -1641,7 +2081,7 @@ export default function App() {
         onClose={() => setIsStandaloneModalOpen(false)}
         campaignState={state}
         onImportCampaign={(newState) => {
-          setState(newState);
+          applyIncomingCampaign(newState, true);
           setCampaignNameInput(newState.campaignName || "Aethelgard");
           setPartyNameInput(newState.partyName || "Campaign Party Alliance");
           if (newState.characters && newState.characters.length > 0) {

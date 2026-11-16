@@ -1,9 +1,11 @@
 import express from "express";
+import http from "http";
 import path from "path";
 import fs from "fs";
+import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
-import { CampaignState, JournalNote, CampaignLocation, Character, DiceRollResult } from "./src/types";
+import { CampaignState, JournalNote, CampaignLocation, Character, DiceRollResult, LiveViewState } from "./src/types";
 
 const app = express();
 
@@ -456,12 +458,19 @@ const defaultCampaignState: CampaignState = {
   currentTurnIndex: 0
 };
 
+let latestStateVersion = 1;
+let campaignWss: WebSocketServer | null = null;
+
 // Ensure configuration / save mechanism works smoothly
 function readCampaignState(): CampaignState {
   try {
     if (fs.existsSync(CAMPAIGN_FILE)) {
       const data = fs.readFileSync(CAMPAIGN_FILE, "utf-8");
-      return JSON.parse(data);
+      const parsed = JSON.parse(data) as CampaignState;
+      if (typeof parsed.stateVersion === "number" && parsed.stateVersion > latestStateVersion) {
+        latestStateVersion = parsed.stateVersion;
+      }
+      return parsed;
     }
   } catch (err) {
     console.error("Error reading campaign file, returning defaults:", err);
@@ -475,6 +484,32 @@ function writeCampaignState(state: CampaignState) {
   } catch (err) {
     console.error("Error writing campaign file:", err);
   }
+}
+
+function broadcastCampaignState(state: CampaignState, eventType: "campaign:init" | "campaign:updated" = "campaign:updated") {
+  if (!campaignWss) return;
+  const payload = JSON.stringify({
+    type: eventType,
+    version: state.stateVersion || latestStateVersion,
+    campaign: state
+  });
+  campaignWss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(payload);
+      } catch (err) {
+        console.warn("WebSocket broadcast send error:", err);
+      }
+    }
+  });
+}
+
+function commitCampaignState(state: CampaignState, eventType: "campaign:init" | "campaign:updated" = "campaign:updated"): CampaignState {
+  latestStateVersion = Math.max(latestStateVersion + 1, (state.stateVersion || 0) + 1);
+  state.stateVersion = latestStateVersion;
+  writeCampaignState(state);
+  broadcastCampaignState(state, eventType);
+  return state;
 }
 
 // Lazy load Gemini AI to avoid crashes if GEMINI_API_KEY is not set yet
@@ -509,7 +544,7 @@ app.post("/api/campaign/meta", (req, res) => {
   const { campaignName, partyName } = req.body;
   if (campaignName !== undefined) campaign.campaignName = campaignName;
   if (partyName !== undefined) campaign.partyName = partyName;
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, campaign });
 });
 
@@ -529,7 +564,7 @@ app.post("/api/campaign/character", (req, res) => {
     campaign.characters.push(character);
   }
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, character, campaign });
 });
 
@@ -539,7 +574,7 @@ app.post("/api/campaign/character/delete", (req, res) => {
   const { characterId } = req.body;
   if (!characterId) return res.status(400).json({ error: "characterId is required" });
   campaign.characters = campaign.characters.filter(c => c.id !== characterId);
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, campaign });
 });
 
@@ -566,7 +601,7 @@ app.post("/api/campaign/move", (req, res) => {
     }
   });
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, campaign });
 });
 
@@ -586,7 +621,7 @@ app.post("/api/campaign/location/toggle-discovered", (req, res) => {
     loc.isHidden = false;
   }
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, campaign });
 });
 
@@ -608,7 +643,7 @@ app.post("/api/campaign/location/update", (req, res) => {
     ...location
   };
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, location: campaign.locations[idx], campaign });
 });
 
@@ -632,7 +667,7 @@ app.post("/api/campaign/location/delete", (req, res) => {
     campaign.locations[0].isDiscovered = true;
   }
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, campaign });
 });
 
@@ -646,7 +681,7 @@ app.post("/api/campaign/location/toggle-boss-slain", (req, res) => {
   }
 
   loc.bossSlain = !loc.bossSlain;
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, location: loc, campaign });
 });
 
@@ -660,7 +695,7 @@ app.post("/api/campaign/location/toggle-hidden", (req, res) => {
   }
 
   loc.isHidden = !loc.isHidden;
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, location: loc, campaign });
 });
 
@@ -678,8 +713,14 @@ app.post("/api/campaign/location/battlemap", (req, res) => {
     const bld = loc.cityBuildings.find((b) => b.id === buildingId);
     if (bld) {
       bld.interiorMaps = interiorMaps;
+      if (activeInteriorMapId !== undefined) {
+        bld.activeInteriorMapId = activeInteriorMapId;
+      }
     } else {
       loc.interiorMaps = interiorMaps;
+      if (activeInteriorMapId !== undefined) {
+        loc.activeInteriorMapId = activeInteriorMapId;
+      }
     }
   } else {
     loc.interiorMaps = interiorMaps;
@@ -688,7 +729,17 @@ app.post("/api/campaign/location/battlemap", (req, res) => {
     }
   }
 
-  writeCampaignState(campaign);
+  if (
+    activeInteriorMapId !== undefined &&
+    campaign.liveView &&
+    campaign.liveView.battleMapLocationId === locationId &&
+    (campaign.liveView.battleMapBuildingId || null) === (buildingId || null)
+  ) {
+    campaign.liveView.activeInteriorMapId = activeInteriorMapId;
+    campaign.liveView.updatedAt = new Date().toISOString();
+  }
+
+  commitCampaignState(campaign);
   res.json({ success: true, location: loc, campaign });
 });
 
@@ -733,7 +784,7 @@ app.post("/api/campaign/fog", (req, res) => {
     return res.status(400).json({ success: false, error: "Unsupported Fog of War targetType" });
   }
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, campaign });
 });
 
@@ -751,7 +802,7 @@ app.post("/api/campaign/region/image", (req, res) => {
   if (name) reg.name = name;
   if (description) reg.description = description;
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, region: reg, campaign });
 });
 
@@ -824,7 +875,7 @@ app.post("/api/campaign/import-data", (req, res) => {
       mediaLibrary: Array.isArray(imported.mediaLibrary) ? imported.mediaLibrary : []
     };
 
-    writeCampaignState(sanitizedCampaign);
+    commitCampaignState(sanitizedCampaign);
     console.log(`Campaign imported successfully: ${sanitizedCampaign.locations.length} locations, ${sanitizedCampaign.characters.length} characters.`);
     res.json({ success: true, campaign: sanitizedCampaign });
   } catch (err: any) {
@@ -862,7 +913,7 @@ app.post("/api/campaign/location/create", (req, res) => {
   }
 
   campaign.locations.push(newLoc);
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, location: newLoc, campaign });
 });
 
@@ -898,7 +949,7 @@ app.post("/api/notes", (req, res) => {
     campaign.notes.unshift(newNote);
   }
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, note: newNote, campaign });
 });
 
@@ -907,7 +958,7 @@ app.delete("/api/notes/:id", (req, res) => {
   const { id } = req.params;
 
   campaign.notes = campaign.notes.filter(n => n.id !== id);
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, campaign });
 });
 
@@ -925,7 +976,7 @@ app.post("/api/dice/log", (req, res) => {
     campaign.recentRolls.pop();
   }
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({ success: true, recentRolls: campaign.recentRolls });
 });
 
@@ -944,11 +995,41 @@ app.post("/api/campaign/initiative", (req, res) => {
     campaign.currentTurnIndex = currentTurnIndex;
   }
 
-  writeCampaignState(campaign);
+  commitCampaignState(campaign);
   res.json({
     success: true,
     campaign
   });
+});
+
+// Broadcast DM live active map / room / battle view for multi-browser Player sync
+app.post("/api/campaign/live-view", (req, res) => {
+  const campaign = readCampaignState();
+  const incoming = req.body as Partial<LiveViewState>;
+  if (!incoming || typeof incoming !== "object") {
+    return res.status(400).json({ success: false, error: "Invalid liveView payload" });
+  }
+
+  if (incoming.regionId) {
+    campaign.currentRegionId = incoming.regionId;
+  }
+
+  campaign.liveView = {
+    regionId: incoming.regionId || campaign.currentRegionId || "sword_coast",
+    navLevel: incoming.navLevel || "realm",
+    cityLocationId: incoming.cityLocationId ?? null,
+    buildingId: incoming.buildingId ?? null,
+    battleMapLocationId: incoming.battleMapLocationId ?? null,
+    battleMapBuildingId: incoming.battleMapBuildingId ?? null,
+    activeInteriorMapId: incoming.activeInteriorMapId ?? null,
+    isBigMapOpen: !!incoming.isBigMapOpen,
+    showLines: incoming.showLines !== undefined ? incoming.showLines : true,
+    showTownNames: incoming.showTownNames !== undefined ? incoming.showTownNames : true,
+    updatedAt: new Date().toISOString()
+  };
+
+  commitCampaignState(campaign);
+  res.json({ success: true, campaign });
 });
 
 // Character Speak Speech Generation Engine (using Gemini TTS)
@@ -1034,15 +1115,17 @@ Write a short, immersive, highly in-character speaking line (1 to 3 sentences ma
 
 // Hot Module Replacement (HMR) and dev server setup
 async function startServer() {
+  let viteServer: Awaited<ReturnType<typeof createViteServer>> | null = null;
+
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
+    viteServer = await createViteServer({
       server: {
         middlewareMode: true,
         hmr: process.env.DISABLE_HMR === "true" ? false : undefined,
       },
       appType: "spa",
     });
-    app.use(vite.middlewares);
+    app.use(viteServer.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
@@ -1051,14 +1134,79 @@ async function startServer() {
     });
   }
 
-  const server = app.listen(PORT, HOST, () => {
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true });
+  campaignWss = wss;
+
+  wss.on("connection", (ws) => {
+    try {
+      const current = readCampaignState();
+      ws.send(
+        JSON.stringify({
+          type: "campaign:init",
+          version: current.stateVersion || latestStateVersion,
+          campaign: current
+        })
+      );
+    } catch (err) {
+      console.warn("WebSocket init send error:", err);
+    }
+
+    ws.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg?.type === "request:sync") {
+          const current = readCampaignState();
+          ws.send(
+            JSON.stringify({
+              type: "campaign:init",
+              version: current.stateVersion || latestStateVersion,
+              campaign: current
+            })
+          );
+        }
+      } catch {
+        // Ignore malformed client frames
+      }
+    });
+  });
+
+  server.on("upgrade", (req, socket, head) => {
+    const pathname = (req.url || "").split("?")[0];
+    if (pathname === "/ws/campaign") {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+      });
+    }
+  });
+
+  server.listen(PORT, HOST, () => {
     console.log(`\n  VITE v6.2.3  ready in 180 ms\n`);
     console.log(`  ➜  Local:   http://localhost:${PORT}/`);
     console.log(`  ➜  Network: http://${HOST}:${PORT}/\n`);
-    console.log(`D&D Companion Server running at http://${HOST}:${PORT}`);
+    console.log(`D&D Companion Server + Live WebSocket running at http://${HOST}:${PORT}`);
   });
 
-  const cleanup = () => {
+  const cleanup = async () => {
+    const forceTimer = setTimeout(() => process.exit(0), 1500);
+    forceTimer.unref();
+    wss.clients.forEach((client) => {
+      try {
+        client.close();
+      } catch {
+        // Ignore
+      }
+    });
+    if (viteServer) {
+      try {
+        await viteServer.close();
+      } catch {
+        // Ignore
+      }
+    }
+    if (typeof (server as any).closeAllConnections === "function") {
+      (server as any).closeAllConnections();
+    }
     server.close(() => {
       process.exit(0);
     });
