@@ -34,7 +34,11 @@ import {
   Image as ImageIcon,
   Shield,
   Clock,
-  Sun
+  Sun,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelTopClose,
+  PanelTopOpen
 } from "lucide-react";
 import MapInterface from "./components/MapInterface";
 import DiceRoller from "./components/DiceRoller";
@@ -125,6 +129,48 @@ export default function App() {
       const next = !prev;
       try {
         sessionStorage.setItem("dnd_follow_dm", next ? "true" : "false");
+      } catch {
+        // Ignore
+      }
+      return next;
+    });
+  };
+
+  // Collapsible Left Party Sidebar state (per-browser via sessionStorage)
+  const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem("dnd_left_sidebar") !== "false";
+    } catch {
+      return true;
+    }
+  });
+
+  const handleToggleLeftSidebar = () => {
+    setIsLeftSidebarOpen((prev) => {
+      const next = !prev;
+      try {
+        sessionStorage.setItem("dnd_left_sidebar", next ? "true" : "false");
+      } catch {
+        // Ignore
+      }
+      return next;
+    });
+  };
+
+  // Collapsible Top Information / Header Bars state (per-browser via sessionStorage)
+  const [isTopBarOpen, setIsTopBarOpen] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem("dnd_top_bar") !== "false";
+    } catch {
+      return true;
+    }
+  });
+
+  const handleToggleTopBar = () => {
+    setIsTopBarOpen((prev) => {
+      const next = !prev;
+      try {
+        sessionStorage.setItem("dnd_top_bar", next ? "true" : "false");
       } catch {
         // Ignore
       }
@@ -803,7 +849,8 @@ export default function App() {
   return (
     <div className="h-[100dvh] max-h-[100dvh] bg-[#0c0e12] text-[#d1d5db] font-sans flex flex-col overflow-hidden selection:bg-amber-500 selection:text-black">
       
-      {/* HEADER BANNER - EDITABLE CAMPAIGN NAME & NAVIGATION */}
+      {/* HEADER BANNER - EDITABLE CAMPAIGN NAME & NAVIGATION (COLLAPSIBLE) */}
+      {isTopBarOpen ? (
       <header className="h-16 sm:h-18 shrink-0 border-b border-white/10 bg-[#0f1117] flex items-center justify-between px-4 sm:px-6 lg:px-8 shadow-md">
         <div className="flex items-center gap-3 sm:gap-6 min-w-0">
           {/* Editable Campaign Title */}
@@ -860,7 +907,37 @@ export default function App() {
             </button>
           </div>
 
-          <div className="flex items-center gap-2 ml-2 sm:ml-4">
+          <div className="flex items-center gap-1.5 ml-2 sm:ml-4">
+            {/* Top Information Collapse Toggle */}
+            <button
+              type="button"
+              onClick={handleToggleTopBar}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-white/10 bg-[#151722] text-slate-300 hover:text-white hover:border-amber-500/40 text-xs font-mono transition-all cursor-pointer"
+              title="Collapse Top Information & Toolbars to maximize map height"
+            >
+              <PanelTopClose className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden xl:inline">Hide Top</span>
+            </button>
+
+            {/* Left Party Sidebar Toggle */}
+            <button
+              type="button"
+              onClick={handleToggleLeftSidebar}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
+                isLeftSidebarOpen
+                  ? "bg-[#151722] border-white/10 text-slate-300 hover:text-white hover:border-amber-500/40"
+                  : "bg-amber-500/15 border-amber-500/50 text-amber-300 font-bold"
+              }`}
+              title={isLeftSidebarOpen ? "Collapse Left Party Panel to widen map" : "Open Left Party Panel"}
+            >
+              {isLeftSidebarOpen ? (
+                <PanelLeftClose className="w-3.5 h-3.5 text-amber-400" />
+              ) : (
+                <PanelLeftOpen className="w-3.5 h-3.5 text-amber-400" />
+              )}
+              <span className="hidden xl:inline">{isLeftSidebarOpen ? "Hide Party" : "Show Party"}</span>
+            </button>
+
             {/* Per-Browser DM / Player Role Switcher */}
             <div className="hidden sm:flex items-center bg-[#151722] p-0.5 rounded-lg border border-white/10 text-[10px] font-mono">
               <button
@@ -901,29 +978,56 @@ export default function App() {
           </div>
         </div>
       </header>
+      ) : activeTab !== "map" ? (
+        <div className="shrink-0 bg-[#0f1117] border-b border-white/10 px-4 py-1.5 flex items-center justify-between text-xs font-mono">
+          <span className="text-amber-400 font-serif italic font-bold">{campaignTitle}</span>
+          <button
+            type="button"
+            onClick={handleToggleTopBar}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-amber-500/40 bg-amber-500/15 text-amber-300 font-bold cursor-pointer"
+          >
+            <PanelTopOpen className="w-3.5 h-3.5" />
+            <span>Show Top Bar</span>
+          </button>
+        </div>
+      ) : null}
 
       {/* CORE WORKSPACE PANELS */}
-      <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
+      <div className="flex-1 flex flex-col md:flex-row min-h-0 overflow-hidden">
         
-        {/* LEFT WORKSPACE SIDEBAR - THE D&D PARTY ROSTER (EASILY MODIFIABLE) */}
-        <aside className="w-full lg:w-80 shrink-0 max-h-[30vh] lg:max-h-full border-b lg:border-b-0 lg:border-r border-white/5 bg-[#0f1117] flex flex-col min-h-0 overflow-hidden">
+        {/* LEFT WORKSPACE SIDEBAR - THE D&D PARTY ROSTER (COLLAPSIBLE) */}
+        <aside
+          className={`w-full md:w-72 lg:w-80 shrink-0 max-h-[30vh] md:max-h-full border-b md:border-b-0 md:border-r border-white/5 bg-[#0f1117] flex-col min-h-0 overflow-hidden ${
+            isLeftSidebarOpen ? "flex" : "hidden"
+          }`}
+        >
           
           {/* Party list heading with Party Name editing */}
-          <div className="p-3 sm:p-4 border-b border-white/5 bg-black/10 flex items-center justify-between shrink-0">
-            <div className="flex items-center space-x-1.5 group cursor-pointer" onClick={() => setIsEditingCampaignMeta(true)}>
-              <h2 className="text-[11px] uppercase tracking-widest text-amber-500 font-bold font-mono truncate max-w-[170px]">
+          <div className="p-3 sm:p-4 border-b border-white/5 bg-black/10 flex items-center justify-between shrink-0 gap-2">
+            <div className="flex items-center space-x-1.5 group cursor-pointer min-w-0" onClick={() => setIsEditingCampaignMeta(true)}>
+              <h2 className="text-[11px] uppercase tracking-widest text-amber-500 font-bold font-mono truncate max-w-[155px]">
                 {partyAllianceName}
               </h2>
-              <Edit2 className="w-3 h-3 text-slate-500 group-hover:text-amber-400 transition-colors" />
+              <Edit2 className="w-3 h-3 text-slate-500 group-hover:text-amber-400 transition-colors shrink-0" />
             </div>
 
-            <button
-              onClick={() => setIsAddingHero(!isAddingHero)}
-              className="text-[10px] uppercase font-mono text-slate-400 hover:text-amber-500 flex items-center gap-1 border border-white/10 px-2.5 py-1 rounded-lg transition-all cursor-pointer bg-white/5"
-            >
-              <UserPlus className="w-3 h-3 text-amber-400" />
-              <span>Add Hero</span>
-            </button>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                onClick={() => setIsAddingHero(!isAddingHero)}
+                className="text-[10px] uppercase font-mono text-slate-400 hover:text-amber-500 flex items-center gap-1 border border-white/10 px-2.5 py-1 rounded-lg transition-all cursor-pointer bg-white/5"
+              >
+                <UserPlus className="w-3 h-3 text-amber-400" />
+                <span>Add Hero</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleToggleLeftSidebar}
+                className="p-1.5 text-slate-400 hover:text-amber-400 border border-white/10 rounded-lg bg-white/5 hover:bg-white/10 transition-all cursor-pointer"
+                title="Collapse Left Party Panel"
+              >
+                <PanelLeftClose className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
 
           {/* Hero addition tray */}
@@ -1313,13 +1417,17 @@ export default function App() {
 
         {/* CENTER COMPONENT - SWITCHABLE TAB TILES */}
         <main className="flex-1 flex flex-col min-h-0 relative overflow-hidden">
-          <div className={activeTab === "map" ? "flex-1 p-2 sm:p-3 lg:p-4 min-h-0 flex flex-col overflow-hidden" : "hidden"}>
+          <div className={activeTab === "map" ? "flex-1 p-1.5 sm:p-2 lg:p-3 min-h-0 flex flex-col overflow-hidden" : "hidden"}>
             <MapInterface
               campaignState={state}
               isDmMode={isDmMode}
               onSetIsDmMode={handleSetIsDmMode}
               followDm={followDm}
               onToggleFollowDm={handleToggleFollowDm}
+              isLeftSidebarOpen={isLeftSidebarOpen}
+              onToggleLeftSidebar={handleToggleLeftSidebar}
+              isTopBarOpen={isTopBarOpen}
+              onToggleTopBar={handleToggleTopBar}
               onUpdateLiveView={handleUpdateLiveView}
               onMoveParty={handleMoveParty}
               onToggleDiscovered={handleToggleDiscovered}

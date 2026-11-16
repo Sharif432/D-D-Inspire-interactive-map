@@ -29,7 +29,11 @@ import {
   Cloud,
   CloudOff,
   Eraser,
-  Undo2
+  Undo2,
+  PanelRightClose,
+  PanelRightOpen,
+  PanelTopClose,
+  PanelTopOpen
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import FogOfWarOverlay from "./FogOfWarOverlay";
@@ -171,6 +175,44 @@ export default function SiteBattleMapModal({
   const [isImageImporterOpen, setIsImageImporterOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isAddMapOpen, setIsAddMapOpen] = useState(false);
+  const [isHudOpen, setIsHudOpen] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem("dnd_battle_hud") !== "false";
+    } catch {
+      return true;
+    }
+  });
+  const [isTopBarOpen, setIsTopBarOpen] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem("dnd_battle_top_bar") !== "false";
+    } catch {
+      return true;
+    }
+  });
+
+  const handleToggleHud = () => {
+    setIsHudOpen((prev) => {
+      const next = !prev;
+      try {
+        sessionStorage.setItem("dnd_battle_hud", next ? "true" : "false");
+      } catch {
+        // Ignore
+      }
+      return next;
+    });
+  };
+
+  const handleToggleTopBar = () => {
+    setIsTopBarOpen((prev) => {
+      const next = !prev;
+      try {
+        sessionStorage.setItem("dnd_battle_top_bar", next ? "true" : "false");
+      } catch {
+        // Ignore
+      }
+      return next;
+    });
+  };
 
   // Image importer form states
   const [urlInput, setUrlInput] = useState("");
@@ -348,7 +390,7 @@ export default function SiteBattleMapModal({
     const ro = new ResizeObserver(updateSize);
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [isHudOpen, isTopBarOpen]);
 
   // Auto-fit tactical grid into viewport on initial open, room switch, or grid size change
   useEffect(() => {
@@ -806,6 +848,7 @@ export default function SiteBattleMapModal({
     <div className="fixed inset-0 z-50 h-[100dvh] max-h-[100dvh] bg-black/90 backdrop-blur-md flex flex-col p-2 md:p-4 text-slate-200 overflow-hidden font-sans select-none animate-in fade-in duration-200">
       
       {/* TOP HEADER COMMAND BAR */}
+      {isTopBarOpen && (
       <div className="bg-[#0f1117] border border-white/10 rounded-2xl p-2.5 md:p-3.5 mb-2.5 flex flex-wrap items-center justify-between gap-2.5 shadow-2xl shrink-0">
         
         {/* Left: Multi-level Breadcrumbs & Location Identification */}
@@ -968,6 +1011,36 @@ export default function SiteBattleMapModal({
             <Trash2 className="w-4 h-4" />
           </button>
 
+          {/* Toggle Top Command Bar */}
+          <button
+            type="button"
+            onClick={handleToggleTopBar}
+            className="px-2.5 py-1.5 rounded-lg text-2xs uppercase font-mono font-bold transition-all flex items-center space-x-1.5 cursor-pointer border bg-[#1a1c28] text-slate-300 border-white/10 hover:text-white"
+            title="Collapse Top Command Bar"
+          >
+            <PanelTopClose className="w-3.5 h-3.5 text-amber-400" />
+            <span className="hidden sm:inline">Hide Top</span>
+          </button>
+
+          {/* Toggle Right Tactical Chamber HUD */}
+          <button
+            type="button"
+            onClick={handleToggleHud}
+            className={`px-2.5 py-1.5 rounded-lg text-2xs uppercase font-mono font-bold transition-all flex items-center space-x-1.5 cursor-pointer border ${
+              isHudOpen
+                ? "bg-[#1a1c28] text-slate-300 border-white/10 hover:text-white"
+                : "bg-amber-500/20 text-amber-300 border-amber-500/40"
+            }`}
+            title={isHudOpen ? "Collapse Tactical HUD to widen grid" : "Open Tactical HUD"}
+          >
+            {isHudOpen ? (
+              <PanelRightClose className="w-3.5 h-3.5 text-amber-400" />
+            ) : (
+              <PanelRightOpen className="w-3.5 h-3.5 text-amber-400" />
+            )}
+            <span className="hidden sm:inline">{isHudOpen ? "Hide HUD" : "Show HUD"}</span>
+          </button>
+
           <div className="h-6 w-px bg-white/10 mx-1" />
 
           {/* Close Modal */}
@@ -981,6 +1054,7 @@ export default function SiteBattleMapModal({
         </div>
 
       </div>
+      )}
 
       {/* DM FOG OF WAR MANAGEMENT BAR FOR BATTLE MAP */}
       {effectiveDmMode && isFogToolbarOpen && (
@@ -1085,8 +1159,41 @@ export default function SiteBattleMapModal({
         {/* LEFT / CENTER: THE INTERACTIVE TACTICAL COMBAT GRID CANVAS */}
         <div className="flex-1 min-h-0 bg-[#0a0c10] border border-white/10 rounded-2xl overflow-hidden relative shadow-inner flex flex-col">
           
-          {/* Canvas Floating Overlay Controls (Tools, Zoom, Ruler distance) */}
-          <div className="absolute top-3 left-3 z-30 flex items-center space-x-2 bg-[#0f1117]/90 backdrop-blur border border-white/10 p-1.5 rounded-xl shadow-lg">
+          {/* Canvas Floating Overlay Controls (Tools, Zoom, Ruler distance, Restore Bars) */}
+          <div className="absolute top-3 left-3 z-30 flex flex-wrap items-center gap-1.5 bg-[#0f1117]/90 backdrop-blur border border-white/10 p-1.5 rounded-xl shadow-lg max-w-[95%]">
+            {!isTopBarOpen && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleToggleTopBar}
+                  className="px-2.5 py-1 rounded text-3xs font-mono uppercase font-bold flex items-center space-x-1 cursor-pointer bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30"
+                  title="Show Top Command Bar"
+                >
+                  <PanelTopOpen className="w-3 h-3" />
+                  <span>Show Top</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="px-2 py-1 rounded text-3xs font-mono uppercase font-bold flex items-center space-x-1 cursor-pointer bg-white/5 hover:bg-red-950/50 text-slate-300 hover:text-red-400 border border-white/10"
+                  title="Exit Site Interior Map"
+                >
+                  <X className="w-3 h-3" />
+                  <span>Exit</span>
+                </button>
+              </>
+            )}
+            {!isHudOpen && (
+              <button
+                type="button"
+                onClick={handleToggleHud}
+                className="px-2.5 py-1 rounded text-3xs font-mono uppercase font-bold flex items-center space-x-1 cursor-pointer bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30"
+                title="Open Tactical HUD Panel"
+              >
+                <PanelRightOpen className="w-3 h-3" />
+                <span>HUD</span>
+              </button>
+            )}
             
             {/* Tool: Select/Move */}
             <button
@@ -1516,20 +1623,34 @@ export default function SiteBattleMapModal({
 
         </div>
 
-        {/* RIGHT / SIDE PANEL: TACTICAL TOKEN INSPECTOR & CHAMBER REPORT */}
-        <div className="w-full lg:w-80 max-h-[32vh] lg:max-h-full min-h-0 bg-[#0f1117] border border-white/10 rounded-2xl p-3 sm:p-4 flex flex-col justify-between shrink-0 space-y-3 shadow-xl overflow-y-auto">
+        {/* RIGHT / SIDE PANEL: TACTICAL TOKEN INSPECTOR & CHAMBER REPORT (COLLAPSIBLE) */}
+        <div
+          className={`w-full lg:w-80 max-h-[32vh] lg:max-h-full min-h-0 bg-[#0f1117] border border-white/10 rounded-2xl p-3 sm:p-4 flex-col justify-between shrink-0 space-y-3 shadow-xl overflow-y-auto ${
+            isHudOpen ? "flex" : "hidden"
+          }`}
+        >
           
           <div className="space-y-4">
             
             {/* Header / Active Map details */}
             <div className="border-b border-white/10 pb-3">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <span className="text-3xs uppercase font-mono text-amber-500 font-bold">
                   Tactical Chamber HUD
                 </span>
-                <span className="text-3xs font-mono text-slate-400">
-                  {activeMap.tokens.length} Token{activeMap.tokens.length === 1 ? "" : "s"}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-3xs font-mono text-slate-400">
+                    {activeMap.tokens.length} Token{activeMap.tokens.length === 1 ? "" : "s"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleToggleHud}
+                    className="p-1 text-slate-400 hover:text-amber-400 rounded hover:bg-white/5 transition-colors cursor-pointer"
+                    title="Collapse Tactical HUD"
+                  >
+                    <PanelRightClose className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
               <h3 className="text-base font-bold text-white font-serif italic mt-1">
                 {activeMap.name}

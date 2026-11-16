@@ -36,7 +36,13 @@ import {
   Cloud,
   CloudOff,
   Eraser,
-  Undo2
+  Undo2,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
+  PanelTopClose,
+  PanelTopOpen
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import SiteBattleMapModal from "./SiteBattleMapModal";
@@ -57,6 +63,10 @@ interface MapInterfaceProps {
   onSetIsDmMode?: (dm: boolean) => void;
   followDm?: boolean;
   onToggleFollowDm?: () => void;
+  isLeftSidebarOpen?: boolean;
+  onToggleLeftSidebar?: () => void;
+  isTopBarOpen?: boolean;
+  onToggleTopBar?: () => void;
   onUpdateLiveView?: (liveView: LiveViewState) => Promise<void>;
   onMoveParty: (locationId: string) => Promise<void>;
   onToggleDiscovered: (locationId: string) => Promise<void>;
@@ -116,6 +126,10 @@ export default function MapInterface({
   onSetIsDmMode,
   followDm = true,
   onToggleFollowDm,
+  isLeftSidebarOpen = true,
+  onToggleLeftSidebar,
+  isTopBarOpen: externalTopBarOpen,
+  onToggleTopBar,
   onUpdateLiveView,
   onMoveParty,
   onToggleDiscovered,
@@ -184,6 +198,56 @@ export default function MapInterface({
   const [isDmRosterOpen, setIsDmRosterOpen] = useState(false);
   const [rosterSearch, setRosterSearch] = useState("");
   const isApplyingLiveViewRef = useRef<boolean>(false);
+
+  // Collapsible Top Bar fallback state (if parent App.tsx doesn't pass controlled prop)
+  const [localTopBarOpen, setLocalTopBarOpen] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem("dnd_top_bar") !== "false";
+    } catch {
+      return true;
+    }
+  });
+  const effectiveTopBarOpen = externalTopBarOpen !== undefined ? externalTopBarOpen : localTopBarOpen;
+
+  const handleToggleTopBar = () => {
+    if (onToggleTopBar) {
+      onToggleTopBar();
+    } else {
+      setLocalTopBarOpen((prev) => {
+        const next = !prev;
+        try {
+          sessionStorage.setItem("dnd_top_bar", next ? "true" : "false");
+        } catch {
+          // Ignore
+        }
+        return next;
+      });
+    }
+  };
+
+  // Collapsible Right Info / Inspector Panel state (per-browser via sessionStorage)
+  const [isRightPanelOpen, setIsRightPanelOpen] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem("dnd_right_panel") !== "false";
+    } catch {
+      return true;
+    }
+  });
+
+  const handleToggleRightPanel = () => {
+    setIsRightPanelOpen((prev) => {
+      const next = !prev;
+      if (!next) {
+        setMobileTab("map");
+      }
+      try {
+        sessionStorage.setItem("dnd_right_panel", next ? "true" : "false");
+      } catch {
+        // Ignore
+      }
+      return next;
+    });
+  };
 
   // Edit Location Modal State
   const [editingLocation, setEditingLocation] = useState<CampaignLocation | null>(null);
@@ -966,7 +1030,7 @@ export default function MapInterface({
     bindObserver(mapContainerRef.current, setStandardViewportSize);
     bindObserver(bigMapContainerRef.current, setBigViewportSize);
     return () => observers.forEach((ro) => ro.disconnect());
-  }, [isBigMapOpen, mobileTab]);
+  }, [isBigMapOpen, mobileTab, isRightPanelOpen, isLeftSidebarOpen, effectiveTopBarOpen]);
 
   // Non-passive wheel listeners so mouse-wheel zoom never scrolls page or gets blocked
   useEffect(() => {
@@ -1402,7 +1466,9 @@ export default function MapInterface({
   return (
     <div className="bg-[#0e1017] border border-white/10 rounded-2xl overflow-hidden shadow-2xl flex flex-col h-full min-h-0 font-sans text-slate-200">
       
-      {/* TOP HEADER CONTROLS (RESPONSIVE) */}
+      {/* TOP HEADER CONTROLS (COLLAPSIBLE & RESPONSIVE) */}
+      {effectiveTopBarOpen && (
+      <>
       <div className="p-2.5 sm:p-3 bg-[#12141e] border-b border-white/10 flex flex-wrap items-center justify-between gap-2 shrink-0">
         
         {/* Left: Territory Title & Mode Switcher */}
@@ -1458,7 +1524,18 @@ export default function MapInterface({
           {/* DM Roster / Secret Toggle Button */}
           {isDmMode && (
             <button
-              onClick={() => setIsDmRosterOpen(!isDmRosterOpen)}
+              onClick={() => {
+                const next = !isDmRosterOpen;
+                setIsDmRosterOpen(next);
+                if (next && !isRightPanelOpen) {
+                  setIsRightPanelOpen(true);
+                  try {
+                    sessionStorage.setItem("dnd_right_panel", "true");
+                  } catch {
+                    // Ignore
+                  }
+                }
+              }}
               className="px-2.5 py-1 bg-purple-950/40 hover:bg-purple-900/50 border border-purple-500/30 text-purple-300 rounded-lg text-xs font-mono flex items-center gap-1.5 transition-all cursor-pointer"
               title={mapNavLevel === "city" ? "Manage hidden/visible city Places of Interest" : "Toggle Secret Locations on/off by name"}
             >
@@ -1572,6 +1649,55 @@ export default function MapInterface({
             </button>
           )}
 
+          {/* Top, Left & Right Panel Toggles (always visible across Realm, City & Tavern) */}
+          <div className="flex items-center bg-[#1a1d2c] border border-white/10 rounded-lg p-0.5 text-2xs font-mono">
+            <button
+              type="button"
+              onClick={handleToggleTopBar}
+              className="px-2 py-1 rounded flex items-center gap-1 text-slate-300 hover:text-white hover:bg-white/5 transition-all cursor-pointer"
+              title="Collapse Top Information Bar"
+            >
+              <PanelTopClose className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden md:inline">Top</span>
+            </button>
+            {onToggleLeftSidebar && (
+              <button
+                type="button"
+                onClick={onToggleLeftSidebar}
+                className={`px-2 py-1 rounded flex items-center gap-1 transition-all cursor-pointer ${
+                  isLeftSidebarOpen
+                    ? "text-slate-300 hover:text-white hover:bg-white/5"
+                    : "bg-amber-500/20 text-amber-300 font-bold"
+                }`}
+                title={isLeftSidebarOpen ? "Collapse Left Party Panel" : "Open Left Party Panel"}
+              >
+                {isLeftSidebarOpen ? (
+                  <PanelLeftClose className="w-3.5 h-3.5 text-amber-400" />
+                ) : (
+                  <PanelLeftOpen className="w-3.5 h-3.5 text-amber-400" />
+                )}
+                <span className="hidden md:inline">Party</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleToggleRightPanel}
+              className={`px-2 py-1 rounded flex items-center gap-1 transition-all cursor-pointer ${
+                isRightPanelOpen
+                  ? "text-slate-300 hover:text-white hover:bg-white/5"
+                  : "bg-amber-500/20 text-amber-300 font-bold"
+              }`}
+              title={isRightPanelOpen ? "Collapse Right Location & Info Panel" : "Open Right Location & Info Panel"}
+            >
+              {isRightPanelOpen ? (
+                <PanelRightClose className="w-3.5 h-3.5 text-amber-400" />
+              ) : (
+                <PanelRightOpen className="w-3.5 h-3.5 text-amber-400" />
+              )}
+              <span className="hidden md:inline">Info</span>
+            </button>
+          </div>
+
           {/* Full Screen Big Map Projector */}
           <button
             onClick={() => setIsBigMapOpen(true)}
@@ -1682,9 +1808,11 @@ export default function MapInterface({
           )}
         </div>
       </div>
+      </>
+      )}
 
-      {/* MOBILE DEVICE TAB SWITCHER (For iPhone & small screens) */}
-      <div className="lg:hidden flex border-b border-white/10 bg-[#12141e] text-xs font-mono shrink-0">
+      {/* MOBILE DEVICE TAB SWITCHER (For iPhone & narrow <md screens) */}
+      <div className="md:hidden flex border-b border-white/10 bg-[#12141e] text-xs font-mono shrink-0">
         <button
           onClick={() => setMobileTab("map")}
           className={`flex-1 py-2 text-center transition-colors ${
@@ -1694,18 +1822,26 @@ export default function MapInterface({
           🗺️ Interactive Map
         </button>
         <button
-          onClick={() => setMobileTab("details")}
+          onClick={() => {
+            setIsRightPanelOpen(true);
+            try { sessionStorage.setItem("dnd_right_panel", "true"); } catch {}
+            setMobileTab("details");
+          }}
           className={`flex-1 py-2 text-center transition-colors ${
-            mobileTab === "details" ? "bg-amber-500/10 text-amber-400 font-bold border-b-2 border-amber-500" : "text-slate-400"
+            mobileTab === "details" && isRightPanelOpen ? "bg-amber-500/10 text-amber-400 font-bold border-b-2 border-amber-500" : "text-slate-400"
           }`}
         >
           📜 Location Details {selectedLocation ? `(${selectedLocation.name.split(" ")[0]})` : ""}
         </button>
         {isDmMode && (
           <button
-            onClick={() => setMobileTab("roster")}
+            onClick={() => {
+              setIsRightPanelOpen(true);
+              try { sessionStorage.setItem("dnd_right_panel", "true"); } catch {}
+              setMobileTab("roster");
+            }}
             className={`flex-1 py-2 text-center transition-colors ${
-              mobileTab === "roster" ? "bg-purple-500/10 text-purple-300 font-bold border-b-2 border-purple-500" : "text-slate-400"
+              mobileTab === "roster" && isRightPanelOpen ? "bg-purple-500/10 text-purple-300 font-bold border-b-2 border-purple-500" : "text-slate-400"
             }`}
           >
             👁️ {mapNavLevel === "city" ? "Secret POIs" : "Secret Roster"}
@@ -1889,16 +2025,76 @@ export default function MapInterface({
       )}
 
       {/* MAIN WORKSPACE: MAP CANVAS + SIDE SCRIBE PANEL */}
-      <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden relative">
+      <div className="flex-1 flex flex-col md:flex-row min-h-0 overflow-hidden relative">
         
         {/* MAP CANVAS VIEWPORT */}
         <div 
           className={`flex-1 min-h-0 flex flex-col relative overflow-hidden bg-[#07090e] ${
-            mobileTab !== "map" ? "hidden lg:flex" : "flex"
+            mobileTab !== "map" && isRightPanelOpen ? "hidden md:flex" : "flex"
           }`}
         >
+          {/* FLOATING TOP-LEFT EXPAND BAR WHEN TOP BAR OR PARTY SIDEBAR IS COLLAPSED */}
+          {(!effectiveTopBarOpen || (onToggleLeftSidebar && !isLeftSidebarOpen)) && (
+            <div className="absolute top-3 left-3 z-30 flex flex-wrap items-center gap-1.5">
+              {!effectiveTopBarOpen && (
+                <button
+                  type="button"
+                  onClick={handleToggleTopBar}
+                  className="flex items-center gap-1.5 bg-[#0f111a]/90 hover:bg-[#1a1e2e] backdrop-blur-md border border-amber-500/40 hover:border-amber-400 text-amber-300 rounded-xl px-2.5 py-1.5 text-3xs font-mono font-bold shadow-xl cursor-pointer transition-all"
+                  title="Show Top Information & Toolbars"
+                >
+                  <PanelTopOpen className="w-3.5 h-3.5" />
+                  <span>Show Top</span>
+                </button>
+              )}
+              {onToggleLeftSidebar && !isLeftSidebarOpen && (
+                <button
+                  type="button"
+                  onClick={onToggleLeftSidebar}
+                  className="flex items-center gap-1.5 bg-[#0f111a]/90 hover:bg-[#1a1e2e] backdrop-blur-md border border-white/15 hover:border-amber-500/50 text-slate-200 hover:text-amber-300 rounded-xl px-2.5 py-1.5 text-3xs font-mono font-bold shadow-xl cursor-pointer transition-all"
+                  title="Open Party Panel"
+                >
+                  <PanelLeftOpen className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Party</span>
+                </button>
+              )}
+              {!effectiveTopBarOpen && mapNavLevel === "city" && (
+                <button
+                  type="button"
+                  onClick={handleReturnToRealm}
+                  className="flex items-center gap-1 bg-[#0f111a]/90 hover:bg-[#1a1e2e] backdrop-blur-md border border-white/15 text-slate-200 hover:text-white rounded-xl px-2.5 py-1.5 text-3xs font-mono shadow-xl cursor-pointer transition-all"
+                  title="Return to Realm Map"
+                >
+                  <span>← Realm</span>
+                </button>
+              )}
+              {!effectiveTopBarOpen && mapNavLevel === "tavern" && (
+                <button
+                  type="button"
+                  onClick={handleReturnToCity}
+                  className="flex items-center gap-1 bg-[#0f111a]/90 hover:bg-[#1a1e2e] backdrop-blur-md border border-white/15 text-slate-200 hover:text-white rounded-xl px-2.5 py-1.5 text-3xs font-mono shadow-xl cursor-pointer transition-all"
+                  title="Return to City Map"
+                >
+                  <span>← City</span>
+                </button>
+              )}
+            </div>
+          )}
+
           {/* FLOATING HUD CONTROLS (PAN & ZOOM HUD) */}
           <div className="absolute top-3 right-3 z-30 flex flex-col space-y-1.5 bg-[#0f111a]/90 backdrop-blur-md border border-white/10 rounded-xl p-1.5 shadow-xl">
+            <button
+              type="button"
+              onClick={handleToggleRightPanel}
+              className={`flex items-center justify-center p-2 rounded-lg transition-colors cursor-pointer ${
+                !isRightPanelOpen
+                  ? "bg-amber-500/20 text-amber-300 hover:bg-amber-500/30"
+                  : "hover:bg-white/10 text-slate-300 hover:text-white"
+              }`}
+              title={isRightPanelOpen ? "Collapse Right Location & Info Panel" : "Open Right Location & Info Panel"}
+            >
+              {isRightPanelOpen ? <PanelRightClose className="w-4 h-4" /> : <PanelRightOpen className="w-4 h-4" />}
+            </button>
             <button
               onClick={() => setZoomScale((prev) => Math.min(4.0, parseFloat((prev + 0.25).toFixed(2))))}
               className="p-2 hover:bg-white/10 rounded-lg text-slate-300 hover:text-white transition-colors cursor-pointer"
@@ -2079,7 +2275,7 @@ export default function MapInterface({
                       onClick={(e) => {
                         e.stopPropagation();
                         setSelectedLocation(loc);
-                        setMobileTab("details");
+                        if (isRightPanelOpen) setMobileTab("details");
                       }}
                       className={`relative ${pinSizeCfg.realmBtn} rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
                         isPartyHere
@@ -2193,7 +2389,7 @@ export default function MapInterface({
                           onClick={(e) => {
                             e.stopPropagation();
                             setSelectedBuilding(bld);
-                            setMobileTab("details");
+                            if (isRightPanelOpen) setMobileTab("details");
                           }}
                           className={`relative ${pinSizeCfg.bldBtn} rounded-full border flex items-center justify-center transition-all duration-200 shadow-2xl cursor-pointer ${
                             isBldSelected
@@ -2298,12 +2494,35 @@ export default function MapInterface({
           </div>
         </div>
 
-        {/* SIDE PANEL: SCRIBE & LOCATION DETAILS / DM ROSTER (RESPONSIVE) */}
+        {/* SIDE PANEL: MAP LOCATION DETAILS & DM ROSTER (COLLAPSIBLE & RESPONSIVE) */}
         <div 
-          className={`w-full lg:w-96 min-h-0 max-h-full bg-[#0f111a] border-t lg:border-t-0 lg:border-l border-white/10 p-4 sm:p-5 flex flex-col justify-between shrink-0 overflow-y-auto space-y-4 ${
-            mobileTab === "map" ? "hidden lg:flex" : "flex flex-1 lg:flex-none"
+          className={`w-full md:w-80 lg:w-96 min-h-0 max-h-full bg-[#0f111a] border-t md:border-t-0 md:border-l border-white/10 p-4 sm:p-5 flex-col justify-between shrink-0 overflow-y-auto space-y-4 ${
+            !isRightPanelOpen
+              ? "hidden"
+              : mobileTab === "map"
+              ? "hidden md:flex"
+              : "flex flex-1 md:flex-none"
           }`}
         >
+          {/* Quick Panel Collapse Strip */}
+          <div className="flex items-center justify-between border-b border-white/5 pb-2 -mt-1">
+            <span className="text-3xs font-mono uppercase tracking-wider text-slate-500 font-bold">
+              {mapNavLevel === "city"
+                ? "Map Location & City POIs"
+                : mapNavLevel === "tavern"
+                ? "Interior Location Details"
+                : "Map Location & Inspector"}
+            </span>
+            <button
+              type="button"
+              onClick={handleToggleRightPanel}
+              className="p-1 text-slate-400 hover:text-amber-400 rounded hover:bg-white/5 transition-colors cursor-pointer flex items-center gap-1 text-3xs font-mono"
+              title="Collapse Right Location & Info Panel"
+            >
+              <span>Collapse</span>
+              <PanelRightClose className="w-3.5 h-3.5" />
+            </button>
+          </div>
           {/* VIEW A: DM SECRET ROSTER TAB (Context-aware for City POIs & Realm Locations) */}
           {(mobileTab === "roster" || (isDmRosterOpen && mobileTab !== "details")) && isDmMode ? (
             <div className="space-y-4">
@@ -3613,8 +3832,9 @@ export default function MapInterface({
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 bg-[#07090e] flex flex-col font-sans"
           >
-            {/* Big Map Header Bar */}
-            <div className="h-14 bg-[#0e1017] border-b border-white/10 px-4 sm:px-6 flex items-center justify-between shrink-0">
+            {/* Big Map Header Bar (Collapsible) */}
+            {effectiveTopBarOpen && (
+            <div className="min-h-14 py-2 bg-[#0e1017] border-b border-white/10 px-4 sm:px-6 flex flex-wrap items-center justify-between gap-2 shrink-0">
               <div className="flex items-center space-x-3">
                 <Compass className="w-5 h-5 text-amber-500 animate-spin-slow" />
                 <h2 className="text-base sm:text-lg font-serif italic text-white font-bold">
@@ -3626,7 +3846,7 @@ export default function MapInterface({
               </div>
 
               {/* Big Map Controls */}
-              <div className="flex items-center space-x-2">
+              <div className="flex items-center flex-wrap gap-2">
                 <button
                   onClick={() => setIsRegionImageModalOpen(true)}
                   className="px-2.5 py-1.5 bg-[#171a26] hover:bg-[#202436] text-slate-200 border border-white/10 rounded-lg text-xs font-mono flex items-center gap-1.5 cursor-pointer"
@@ -3694,6 +3914,16 @@ export default function MapInterface({
                 </button>
 
                 <button
+                  type="button"
+                  onClick={handleToggleTopBar}
+                  className="px-2.5 py-1.5 bg-[#171a26] hover:bg-[#202436] text-slate-200 border border-white/10 rounded-lg text-xs font-mono flex items-center gap-1.5 cursor-pointer"
+                  title="Collapse Top Header Bar"
+                >
+                  <PanelTopClose className="w-3.5 h-3.5 text-amber-400" />
+                  <span className="hidden sm:inline">Hide Top</span>
+                </button>
+
+                <button
                   onClick={() => setIsBigMapOpen(false)}
                   className="px-3 py-1.5 bg-white/10 hover:bg-white/20 text-white rounded-lg text-xs font-mono flex items-center gap-1 cursor-pointer"
                 >
@@ -3702,6 +3932,7 @@ export default function MapInterface({
                 </button>
               </div>
             </div>
+            )}
 
             {/* Big Map DM Fog of War Toolbar */}
             {isDmMode && isFogToolbarOpen && (
@@ -3840,8 +4071,53 @@ export default function MapInterface({
                 </div>
               )}
 
+              {/* Floating Top-Left Restore Controls when Big Map Top Header Collapsed */}
+              {!effectiveTopBarOpen && !(repositioningLocId || repositioningBuildingId || (mapNavLevel === "city" && isAddingBuilding)) && (
+                <div className="absolute top-4 left-4 z-40 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleToggleTopBar();
+                    }}
+                    className="px-3 py-1.5 bg-[#0e1017]/90 hover:bg-[#1a1d2b] backdrop-blur-md border border-amber-500/40 text-amber-300 rounded-xl text-xs font-mono font-bold flex items-center gap-1.5 shadow-xl cursor-pointer"
+                    title="Show Top Projector Bar"
+                  >
+                    <PanelTopOpen className="w-3.5 h-3.5" />
+                    <span>Show Top</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setIsBigMapOpen(false);
+                    }}
+                    className="px-2.5 py-1.5 bg-[#0e1017]/90 hover:bg-[#1a1d2b] backdrop-blur-md border border-white/15 text-slate-200 rounded-xl text-xs font-mono flex items-center gap-1 shadow-xl cursor-pointer"
+                    title="Exit Big Map Projector"
+                  >
+                    <Minimize2 className="w-3.5 h-3.5" />
+                    <span>Exit</span>
+                  </button>
+                </div>
+              )}
+
               {/* Floating Big Map HUD */}
               <div className="absolute top-4 right-4 z-40 flex items-center space-x-2 bg-[#0e1017]/90 backdrop-blur-md p-1.5 rounded-xl border border-white/10 shadow-2xl">
+                {/* Toggle Location Info Card */}
+                <button
+                  type="button"
+                  onClick={handleToggleRightPanel}
+                  className={`px-2.5 py-1.5 rounded-lg text-2xs font-mono font-bold flex items-center gap-1.5 border cursor-pointer ${
+                    isRightPanelOpen
+                      ? "bg-[#1a1c28] text-slate-300 border-white/10 hover:text-white"
+                      : "bg-amber-500/20 text-amber-300 border-amber-500/50"
+                  }`}
+                  title={isRightPanelOpen ? "Hide Selected Map Location Info" : "Show Selected Map Location Info"}
+                >
+                  {isRightPanelOpen ? <PanelRightClose className="w-3.5 h-3.5 text-amber-400" /> : <PanelRightOpen className="w-3.5 h-3.5 text-amber-400" />}
+                  <span className="hidden sm:inline">Location</span>
+                </button>
+
                 {/* Road Lines Toggle */}
                 <button
                   onClick={() => setShowLines((prev) => !prev)}
@@ -4136,8 +4412,8 @@ export default function MapInterface({
                 />
               </div>
 
-              {/* Floating Bottom Card: Building POI or Selected Location */}
-              {mapNavLevel === "city" && canViewSelectedBuilding && selectedBuilding ? (
+              {/* Floating Bottom Card: Building POI or Selected Location (Collapsed when Right/Location Info is collapsed) */}
+              {isRightPanelOpen && (mapNavLevel === "city" && canViewSelectedBuilding && selectedBuilding ? (
                 <div className="absolute bottom-5 left-1/2 transform -translate-x-1/2 z-40 bg-[#0e1017]/95 border border-amber-500/40 p-3 sm:p-4 rounded-2xl shadow-2xl backdrop-blur-md flex flex-wrap items-center gap-3 max-w-3xl w-[92%]">
                   <span className="text-3xl select-none">{getBuildingIcon(selectedBuilding.type)}</span>
                   <div className="flex-1 min-w-[160px]">
@@ -4212,6 +4488,17 @@ export default function MapInterface({
                       <Swords className="w-3.5 h-3.5" />
                       <span>Enter Combat Grid</span>
                     </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleToggleRightPanel();
+                      }}
+                      className="p-2 bg-white/5 hover:bg-white/15 text-slate-400 hover:text-amber-300 rounded-xl cursor-pointer"
+                      title="Collapse Map Location Info"
+                    >
+                      <PanelRightClose className="w-4 h-4" />
+                    </button>
                   </div>
                 </div>
               ) : canViewSelectedLocation && selectedLocation && (
@@ -4279,9 +4566,20 @@ export default function MapInterface({
                     >
                       Battle Map
                     </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleToggleRightPanel();
+                      }}
+                      className="p-2 bg-white/5 hover:bg-white/15 text-slate-400 hover:text-amber-300 rounded-xl cursor-pointer"
+                      title="Collapse Map Location Info"
+                    >
+                      <PanelRightClose className="w-4 h-4" />
+                    </button>
                   </div>
                 </div>
-              )}
+              ))}
             </div>
           </motion.div>
         )}
