@@ -137,7 +137,7 @@ export default function App() {
   const applyIncomingCampaign = (nextCampaign: CampaignState | null | undefined, force = false) => {
     if (!nextCampaign) return;
     const incomingVer = typeof nextCampaign.stateVersion === "number" ? nextCampaign.stateVersion : 0;
-    if (!force && incomingVer > 0 && incomingVer < lastVersionRef.current) {
+    if (!force && incomingVer > 0 && incomingVer <= lastVersionRef.current) {
       return;
     }
     if (incomingVer > lastVersionRef.current || force) {
@@ -1313,28 +1313,26 @@ export default function App() {
 
         {/* CENTER COMPONENT - SWITCHABLE TAB TILES */}
         <main className="flex-1 flex flex-col min-h-0 relative overflow-hidden">
-          {activeTab === "map" && (
-            <div className="flex-1 p-2 sm:p-3 lg:p-4 min-h-0 flex flex-col overflow-hidden">
-              <MapInterface
-                campaignState={state}
-                isDmMode={isDmMode}
-                onSetIsDmMode={handleSetIsDmMode}
-                followDm={followDm}
-                onToggleFollowDm={handleToggleFollowDm}
-                onUpdateLiveView={handleUpdateLiveView}
-                onMoveParty={handleMoveParty}
-                onToggleDiscovered={handleToggleDiscovered}
-                onCreateLocation={handleCreateLocation}
-                onSaveBattleMaps={handleSaveBattleMaps}
-                onUpdateRegionImage={handleUpdateRegionImage}
-                onUpdateLocation={handleUpdateLocation}
-                onDeleteLocation={handleDeleteLocation}
-                onToggleBossSlain={handleToggleBossSlain}
-                onToggleHidden={handleToggleHidden}
-                onUpdateFog={handleUpdateFog}
-              />
-            </div>
-          )}
+          <div className={activeTab === "map" ? "flex-1 p-2 sm:p-3 lg:p-4 min-h-0 flex flex-col overflow-hidden" : "hidden"}>
+            <MapInterface
+              campaignState={state}
+              isDmMode={isDmMode}
+              onSetIsDmMode={handleSetIsDmMode}
+              followDm={followDm}
+              onToggleFollowDm={handleToggleFollowDm}
+              onUpdateLiveView={handleUpdateLiveView}
+              onMoveParty={handleMoveParty}
+              onToggleDiscovered={handleToggleDiscovered}
+              onCreateLocation={handleCreateLocation}
+              onSaveBattleMaps={handleSaveBattleMaps}
+              onUpdateRegionImage={handleUpdateRegionImage}
+              onUpdateLocation={handleUpdateLocation}
+              onDeleteLocation={handleDeleteLocation}
+              onToggleBossSlain={handleToggleBossSlain}
+              onToggleHidden={handleToggleHidden}
+              onUpdateFog={handleUpdateFog}
+            />
+          </div>
 
           {activeTab === "dice" && (
             <div className="flex-1 p-3 sm:p-4 lg:p-6 flex flex-col space-y-4 min-h-0 overflow-y-auto">

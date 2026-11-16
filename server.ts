@@ -1116,12 +1116,23 @@ Write a short, immersive, highly in-character speaking line (1 to 3 sentences ma
 // Hot Module Replacement (HMR) and dev server setup
 async function startServer() {
   let viteServer: Awaited<ReturnType<typeof createViteServer>> | null = null;
+  const server = http.createServer(app);
 
   if (process.env.NODE_ENV !== "production") {
     viteServer = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR === "true" ? false : undefined,
+        hmr: process.env.DISABLE_HMR === "true" ? false : { server },
+        watch:
+          process.env.DISABLE_HMR === "true"
+            ? null
+            : {
+                ignored: [
+                  "**/campaign-data.json",
+                  "**/campaign-data.json.*",
+                  "**/*.json.tmp",
+                ],
+              },
       },
       appType: "spa",
     });
@@ -1134,7 +1145,6 @@ async function startServer() {
     });
   }
 
-  const server = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true });
   campaignWss = wss;
 

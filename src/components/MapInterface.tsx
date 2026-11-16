@@ -128,12 +128,39 @@ export default function MapInterface({
   onToggleHidden,
   onUpdateFog
 }: MapInterfaceProps) {
+  const initialLiveView = campaignState.liveView;
   const [activeRegionId, setActiveRegionId] = useState<string>(
-    () => campaignState.liveView?.regionId || campaignState.currentRegionId || "sword_coast"
+    () => initialLiveView?.regionId || campaignState.currentRegionId || "sword_coast"
   );
-  const [selectedLocation, setSelectedLocation] = useState<CampaignLocation | null>(null);
-  const [insideBattleMapLocation, setInsideBattleMapLocation] = useState<CampaignLocation | null>(null);
-  const [insideBattleMapBuildingId, setInsideBattleMapBuildingId] = useState<string | null>(null);
+  const [selectedLocation, setSelectedLocation] = useState<CampaignLocation | null>(() => {
+    const cityId = initialLiveView?.cityLocationId;
+    return cityId ? campaignState.locations.find((l) => l.id === cityId) || null : null;
+  });
+  const [insideBattleMapLocation, setInsideBattleMapLocation] = useState<CampaignLocation | null>(() => {
+    const battleLocId = initialLiveView?.battleMapLocationId;
+    if (!battleLocId) return null;
+    const loc = campaignState.locations.find((l) => l.id === battleLocId);
+    if (!loc) return null;
+    const battleBldId = initialLiveView?.battleMapBuildingId;
+    if (battleBldId) {
+      const bld = loc.cityBuildings?.find((b) => b.id === battleBldId);
+      if (bld) {
+        return {
+          ...loc,
+          name: `${loc.name} - ${bld.name}`,
+          interiorMaps: bld.interiorMaps,
+          activeInteriorMapId: initialLiveView?.activeInteriorMapId || bld.activeInteriorMapId || bld.interiorMaps?.[0]?.id
+        };
+      }
+    }
+    return {
+      ...loc,
+      activeInteriorMapId: initialLiveView?.activeInteriorMapId || loc.activeInteriorMapId || loc.interiorMaps?.[0]?.id
+    };
+  });
+  const [insideBattleMapBuildingId, setInsideBattleMapBuildingId] = useState<string | null>(
+    () => initialLiveView?.battleMapBuildingId ?? null
+  );
   const [isRegionImageModalOpen, setIsRegionImageModalOpen] = useState(false);
   const [regionUrlInput, setRegionUrlInput] = useState("");
   const regionFileInputRef = useRef<HTMLInputElement>(null);
@@ -198,7 +225,7 @@ export default function MapInterface({
   const [tempCoords, setTempCoords] = useState<{ x: number; y: number } | null>(null);
 
   // Big Map states
-  const [isBigMapOpen, setIsBigMapOpen] = useState(false);
+  const [isBigMapOpen, setIsBigMapOpen] = useState<boolean>(() => !!initialLiveView?.isBigMapOpen);
   const [searchQuery, setSearchQuery] = useState("");
   const [showGrid, setShowGrid] = useState(true);
 
@@ -209,10 +236,22 @@ export default function MapInterface({
   const [mapAspect, setMapAspect] = useState<number>(16 / 9);
 
   // Multi-Level Map Hierarchy Navigation: 'realm' (World) -> 'city' (Settlement) -> 'tavern' (Building)
-  const [mapNavLevel, setMapNavLevel] = useState<"realm" | "city" | "tavern">("realm");
-  const [currentCityLocationId, setCurrentCityLocationId] = useState<string | null>(null);
-  const [currentBuildingId, setCurrentBuildingId] = useState<string | null>(null);
-  const [selectedBuilding, setSelectedBuilding] = useState<CityBuildingPin | null>(null);
+  const [mapNavLevel, setMapNavLevel] = useState<"realm" | "city" | "tavern">(
+    () => initialLiveView?.navLevel || "realm"
+  );
+  const [currentCityLocationId, setCurrentCityLocationId] = useState<string | null>(
+    () => initialLiveView?.cityLocationId ?? null
+  );
+  const [currentBuildingId, setCurrentBuildingId] = useState<string | null>(
+    () => initialLiveView?.buildingId ?? null
+  );
+  const [selectedBuilding, setSelectedBuilding] = useState<CityBuildingPin | null>(() => {
+    const cityId = initialLiveView?.cityLocationId;
+    const bldId = initialLiveView?.buildingId;
+    if (!cityId || !bldId) return null;
+    const city = campaignState.locations.find((l) => l.id === cityId);
+    return city?.cityBuildings?.find((b) => b.id === bldId) || null;
+  });
 
   // City & Tavern Image Modal State
   const [isCityImageModalOpen, setIsCityImageModalOpen] = useState(false);
@@ -224,8 +263,12 @@ export default function MapInterface({
   const tavernFileInputRef = useRef<HTMLInputElement>(null);
 
   // Line, Town Name & Pin Size Toggles (default 'sm' so pins don't cover too much of the map)
-  const [showLines, setShowLines] = useState<boolean>(true);
-  const [showTownNames, setShowTownNames] = useState<boolean>(true);
+  const [showLines, setShowLines] = useState<boolean>(() =>
+    initialLiveView?.showLines !== undefined ? !!initialLiveView.showLines : true
+  );
+  const [showTownNames, setShowTownNames] = useState<boolean>(() =>
+    initialLiveView?.showTownNames !== undefined ? !!initialLiveView.showTownNames : true
+  );
   const [pinSize, setPinSize] = useState<"xs" | "sm" | "md">("sm");
 
   // Connection routes editor state (for Edit Location Modal)

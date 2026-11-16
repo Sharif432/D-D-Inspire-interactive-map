@@ -16,7 +16,17 @@ export default defineConfig(() => {
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      // When running locally, ignore campaign-data.json so saving DM actions never triggers a page reload.
+      watch:
+        process.env.DISABLE_HMR === 'true'
+          ? null
+          : {
+              ignored: [
+                '**/campaign-data.json',
+                '**/campaign-data.json.*',
+                '**/*.json.tmp',
+              ],
+            },
     },
   };
 });
