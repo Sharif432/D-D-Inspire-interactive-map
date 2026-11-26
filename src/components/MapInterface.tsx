@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { CampaignLocation, LocationType, CampaignState, SiteBattleMap, CityBuildingPin, FogOfWarState, BuildingType, MapToken, LiveViewState } from "../types";
+import { CampaignLocation, LocationType, CampaignState, SiteBattleMap, CityBuildingPin, FogOfWarState, BuildingType, MapToken, LiveViewState, CombatHpLogEntry } from "../types";
 import { 
   Map, 
   MapPin, 
@@ -72,6 +72,17 @@ interface MapInterfaceProps {
   onToggleDiscovered: (locationId: string) => Promise<void>;
   onCreateLocation: (location: { name: string; description: string; type: LocationType; x: number; y: number; isHidden: boolean }) => Promise<void>;
   onSaveBattleMaps?: (locationId: string, interiorMaps: SiteBattleMap[], activeInteriorMapId: string, buildingId?: string) => Promise<void>;
+  onAdjustTokenHp?: (payload: {
+    locationId: string;
+    buildingId?: string;
+    mapId: string;
+    tokenId: string;
+    delta?: number;
+    setHp?: number;
+    isHpHidden?: boolean;
+  }) => Promise<boolean>;
+  hpLogs?: CombatHpLogEntry[];
+  onClearHpLogs?: () => Promise<void>;
   onUpdateRegionImage?: (regionId: string, imageUrl: string) => Promise<void>;
   onUpdateLocation?: (location: Partial<CampaignLocation> & { id: string }) => Promise<void>;
   onDeleteLocation?: (locationId: string) => Promise<void>;
@@ -135,6 +146,9 @@ export default function MapInterface({
   onToggleDiscovered,
   onCreateLocation,
   onSaveBattleMaps,
+  onAdjustTokenHp,
+  hpLogs,
+  onClearHpLogs,
   onUpdateRegionImage,
   onUpdateLocation,
   onDeleteLocation,
@@ -4619,6 +4633,9 @@ export default function MapInterface({
             setInsideBattleMapBuildingId(null);
           }}
           onSaveBattleMaps={onSaveBattleMaps || (async () => {})}
+          onAdjustTokenHp={onAdjustTokenHp}
+          hpLogs={hpLogs}
+          onClearHpLogs={onClearHpLogs}
           onUpdateFog={onUpdateFog}
           savedImages={savedCampaignImages}
         />

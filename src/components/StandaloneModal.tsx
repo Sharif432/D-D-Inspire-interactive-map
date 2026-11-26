@@ -24,6 +24,7 @@ interface StandaloneModalProps {
   isOpen: boolean;
   onClose: () => void;
   campaignState: CampaignState | null;
+  persistenceMode?: "file" | "kv" | "tmp";
   onImportCampaign: (importedState: CampaignState) => void;
 }
 
@@ -31,6 +32,7 @@ export default function StandaloneModal({
   isOpen,
   onClose,
   campaignState,
+  persistenceMode = "file",
   onImportCampaign
 }: StandaloneModalProps) {
   const [activeTab, setActiveTab] = useState<"export" | "import">("export");
@@ -164,6 +166,11 @@ export default function StandaloneModal({
       });
 
       const responseText = await res.text();
+      if (res.status === 413) {
+        throw new Error(
+          "Save file exceeds the 4.5 MB serverless request limit on cloud hosts. Use smaller/linked map images or export without oversized embedded images."
+        );
+      }
       let result: any;
       try {
         result = JSON.parse(responseText);
@@ -315,7 +322,13 @@ export default function StandaloneModal({
                 <Database className="w-3.5 h-3.5" />
                 Active Session Summary
               </span>
-              <span className="text-slate-500">Auto-saved to disk</span>
+              <span className={persistenceMode === "tmp" ? "text-amber-400" : "text-slate-500"}>
+                {persistenceMode === "kv"
+                  ? "Synced via Vercel Redis / KV"
+                  : persistenceMode === "tmp"
+                  ? "Ephemeral cloud cache — Export JSON or link Redis"
+                  : "Auto-saved to disk"}
+              </span>
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/5 pb-2.5">

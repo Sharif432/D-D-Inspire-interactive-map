@@ -16,7 +16,9 @@ import {
   Sparkles,
   ArrowUpDown,
   Plus,
-  Minus
+  Minus,
+  Eye,
+  EyeOff
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -29,6 +31,7 @@ interface InitiativeOrderProps {
   savedRound?: number;
   savedTurnIndex?: number;
   onSaveInitiative?: (order: InitiativeCombatant[], round: number, turnIndex: number) => void;
+  isDmMode?: boolean;
 }
 
 export default function InitiativeOrder({
@@ -39,7 +42,8 @@ export default function InitiativeOrder({
   savedInitiativeOrder,
   savedRound,
   savedTurnIndex,
-  onSaveInitiative
+  onSaveInitiative,
+  isDmMode = true
 }: InitiativeOrderProps) {
   // Combatants list in initiative
   const [combatants, setCombatants] = useState<InitiativeCombatant[]>(() => {
@@ -72,6 +76,7 @@ export default function InitiativeOrder({
   const [customScore, setCustomScore] = useState<number>(12);
   const [customHp, setCustomHp] = useState<number>(20);
   const [customDex, setCustomDex] = useState<number>(0);
+  const [customIsHpHidden, setCustomIsHpHidden] = useState<boolean>(true);
 
   // Quick Party selector drawer
   const [isPartyPickerOpen, setIsPartyPickerOpen] = useState<boolean>(false);
@@ -170,6 +175,7 @@ export default function InitiativeOrder({
       initiativeScore: defaultScore,
       dexModifier: dexMod,
       hp: char.hp ? { current: char.hp.current, max: char.hp.max } : undefined,
+      isHpHidden: char.isHpHidden,
       isCustom: false
     };
 
@@ -201,6 +207,7 @@ export default function InitiativeOrder({
           initiativeScore: 10 + dexMod,
           dexModifier: dexMod,
           hp: char.hp ? { current: char.hp.current, max: char.hp.max } : undefined,
+          isHpHidden: char.isHpHidden,
           isCustom: false
         });
       }
@@ -227,6 +234,7 @@ export default function InitiativeOrder({
       initiativeScore: Number(customScore) || 10,
       dexModifier: Number(customDex) || 0,
       hp: { current: Number(customHp) || 20, max: Number(customHp) || 20 },
+      isHpHidden: customIsHpHidden,
       isCustom: true
     };
 
@@ -239,6 +247,7 @@ export default function InitiativeOrder({
     setCustomScore(12);
     setCustomHp(20);
     setCustomDex(0);
+    setCustomIsHpHidden(true);
     setIsAddingCustom(false);
     syncInitiative(updated, round, currentTurnIndex);
   };
@@ -358,6 +367,11 @@ export default function InitiativeOrder({
 
   // HP Adjuster
   const handleHpChange = (id: string, delta: number) => {
+    const target = combatants.find((c) => c.id === id);
+    const linked = target?.characterId ? characters.find((ch) => ch.id === target.characterId) : undefined;
+    const isHidden = target?.isHpHidden ?? linked?.isHpHidden ?? false;
+    if (!isDmMode && isHidden) return;
+
     const updated = combatants.map(c => {
       if (c.id === id && c.hp) {
         const nextHp = Math.max(0, Math.min(c.hp.max, c.hp.current + delta));
@@ -367,6 +381,19 @@ export default function InitiativeOrder({
         };
       }
       return c;
+    });
+    setCombatants(updated);
+    syncInitiative(updated, round, currentTurnIndex);
+  };
+
+  // DM Individual HP Hide/Show toggle
+  const handleToggleCombatantHpHidden = (id: string) => {
+    if (!isDmMode) return;
+    const updated = combatants.map((c) => {
+      if (c.id !== id) return c;
+      const linked = c.characterId ? characters.find((ch) => ch.id === c.characterId) : undefined;
+      const currentHidden = c.isHpHidden ?? linked?.isHpHidden ?? false;
+      return { ...c, isHpHidden: !currentHidden };
     });
     setCombatants(updated);
     syncInitiative(updated, round, currentTurnIndex);
@@ -675,6 +702,19 @@ export default function InitiativeOrder({
                   Spawn to Turn
                 </button>
               </div>
+
+              {isDmMode && (
+                <label className="sm:col-span-5 flex items-center gap-2 text-[10px] font-mono text-amber-300 cursor-pointer select-none pt-1">
+                  <input
+                    type="checkbox"
+                    checked={customIsHpHidden}
+                    onChange={(e) => setCustomIsHpHidden(e.target.checked)}
+                    className="rounded bg-[#10121a] border-white/20 text-amber-500 focus:ring-0"
+                  />
+                  <EyeOff className="w-3 h-3 text-amber-400" />
+                  <span>Hide Health Points (HP) from Players (DM Only)</span>
+                </label>
+              )}
             </form>
           </motion.div>
         )}
@@ -816,31 +856,84 @@ export default function InitiativeOrder({
                     {/* Right: Manual Initiative Score Editor & Action buttons */}
                     <div className="flex items-center space-x-3 ml-auto">
                       
-                      {/* HP Tracker mini-bar (if available) */}
-                      {combatant.hp && (
-                        <div className="hidden sm:flex flex-col items-end pr-2 border-r border-white/5 space-y-1">
-                          <div className="flex items-center space-x-1 text-[10px] font-mono text-slate-400">
-                            <Heart className="w-2.5 h-2.5 text-red-400" />
-                            <span>{combatant.hp.current}/{combatant.hp.max}</span>
+                      {/* HP Tracker mini-bar with DM individual Show/Hide toggle */}
+                      {combatant.hp && (() => {
+                        const linkedChar = combatant.characterId
+                          ? characters.find((ch) => ch.id === combatant.characterId)
+                          : undefined;
+                        const isHidden = combatant.isHpHidden ?? linkedChar?.isHpHidden ?? false;
+                        const canViewHp = isDmMode || !isHidden;
+
+                        return (
+                          <div className="flex flex-col items-end pr-2 border-r border-white/5 space-y-1">
+                            <div className="flex items-center space-x-1.5 text-[10px] font-mono text-slate-400">
+                              <Heart className="w-2.5 h-2.5 text-red-400" />
+                              {canViewHp ? (
+                                <span className="font-bold text-slate-200">
+                                  {combatant.hp.current}/{combatant.hp.max}
+                                </span>
+                              ) : (
+                                <span className="text-amber-400/90 font-bold flex items-center gap-1">
+                                  <EyeOff className="w-2.5 h-2.5" />
+                                  Hidden
+                                </span>
+                              )}
+
+                              {isDmMode && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleCombatantHpHidden(combatant.id)}
+                                  className={`px-1 py-0.5 rounded border text-[8px] uppercase inline-flex items-center gap-0.5 cursor-pointer transition-all ${
+                                    isHidden
+                                      ? "bg-amber-500/20 border-amber-500/50 text-amber-300 font-bold"
+                                      : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
+                                  }`}
+                                  title={isHidden ? "HP hidden from players — click to show" : "HP visible to players — click to hide"}
+                                >
+                                  {isHidden ? <EyeOff className="w-2.5 h-2.5" /> : <Eye className="w-2.5 h-2.5" />}
+                                </button>
+                              )}
+                            </div>
+
+                            {canViewHp && (
+                              <div className="flex items-center space-x-1">
+                                <button
+                                  type="button"
+                                  onClick={() => handleHpChange(combatant.id, -5)}
+                                  className="px-1 py-0.5 bg-[#1a1c25] hover:bg-red-950 text-slate-400 hover:text-red-300 rounded text-[9px] font-mono cursor-pointer border border-white/5"
+                                  title="-5 HP (Damage)"
+                                >
+                                  -5
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleHpChange(combatant.id, -1)}
+                                  className="px-1.5 py-0.5 bg-[#1a1c25] hover:bg-red-950 text-slate-400 hover:text-red-300 rounded text-[9px] font-mono cursor-pointer border border-white/5"
+                                  title="-1 HP"
+                                >
+                                  -1
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleHpChange(combatant.id, 1)}
+                                  className="px-1.5 py-0.5 bg-[#1a1c25] hover:bg-emerald-950 text-slate-400 hover:text-emerald-300 rounded text-[9px] font-mono cursor-pointer border border-white/5"
+                                  title="+1 HP (Heal)"
+                                >
+                                  +1
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleHpChange(combatant.id, 5)}
+                                  className="px-1 py-0.5 bg-[#1a1c25] hover:bg-emerald-950 text-slate-400 hover:text-emerald-300 rounded text-[9px] font-mono cursor-pointer border border-white/5"
+                                  title="+5 HP (Heal)"
+                                >
+                                  +5
+                                </button>
+                              </div>
+                            )}
                           </div>
-                          <div className="flex items-center space-x-1">
-                            <button
-                              onClick={() => handleHpChange(combatant.id, -1)}
-                              className="px-1 py-0.2 bg-[#1a1c25] hover:bg-red-950 text-slate-400 hover:text-red-300 rounded text-3xs font-mono cursor-pointer"
-                              title="-1 HP"
-                            >
-                              -
-                            </button>
-                            <button
-                              onClick={() => handleHpChange(combatant.id, 1)}
-                              className="px-1 py-0.2 bg-[#1a1c25] hover:bg-emerald-950 text-slate-400 hover:text-emerald-300 rounded text-3xs font-mono cursor-pointer"
-                              title="+1 HP"
-                            >
-                              +
-                            </button>
-                          </div>
-                        </div>
-                      )}
+                        );
+                      })()}
 
                       {/* Quick Roll Initiative (d20+DEX) */}
                       <button

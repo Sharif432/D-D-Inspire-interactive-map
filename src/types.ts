@@ -18,6 +18,7 @@ export interface Character {
   };
   voice: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
   avatarUrl: string;
+  isHpHidden?: boolean;
   statusEffects?: string[];
   exhaustionLevel?: number;
 }
@@ -66,15 +67,21 @@ export interface MapToken {
   name: string;
   characterId?: string; // if tied to a campaign character
   avatarUrl?: string;
-  type: 'player' | 'enemy' | 'npc';
+  type: 'player' | 'enemy' | 'npc' | 'effect';
   x: number; // grid column (0 to gridCols-1)
   y: number; // grid row (0 to gridRows-1)
   hp?: {
     current: number;
     max: number;
   };
+  isHpHidden?: boolean;
   color?: string;
   notes?: string;
+  effectType?: string;
+  effectIcon?: string;
+  areaRadius?: number; // 0 = 1x1 (5ft), 1 = 3x3 (15ft), 2 = 5x5 (25ft), 3 = 7x7 (35ft)
+  effectDuration?: number; // optional round duration
+  isEffectHidden?: boolean; // hidden hazard/trap visible only to DM until revealed
 }
 
 export interface FogOfWarShape {
@@ -186,7 +193,22 @@ export interface InitiativeCombatant {
     current: number;
     max: number;
   };
+  isHpHidden?: boolean;
   isCustom?: boolean;
+}
+
+export interface CombatHpLogEntry {
+  id: string;
+  targetId: string;
+  characterId?: string;
+  targetName: string;
+  targetType: 'player' | 'enemy' | 'npc';
+  delta: number;
+  previousHp: number;
+  newHp: number;
+  maxHp: number;
+  timestamp: string;
+  context?: string;
 }
 
 export interface CampaignMediaAsset {
@@ -222,6 +244,7 @@ export interface CampaignState {
   initiativeOrder?: InitiativeCombatant[];
   initiativeRound?: number;
   currentTurnIndex?: number;
+  hpLogs?: CombatHpLogEntry[];
   mediaLibrary?: CampaignMediaAsset[];
   liveView?: LiveViewState;
   stateVersion?: number;

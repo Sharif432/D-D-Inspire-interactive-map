@@ -9,7 +9,8 @@ import {
   SiteBattleMap, 
   CampaignLocation,
   FogOfWarState,
-  LiveViewState
+  LiveViewState,
+  CombatHpLogEntry
 } from "./types";
 import { 
   BookOpen, 
@@ -35,6 +36,8 @@ import {
   Shield,
   Clock,
   Sun,
+  Eye,
+  EyeOff,
   PanelLeftClose,
   PanelLeftOpen,
   PanelTopClose,
@@ -82,6 +85,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isStandaloneModalOpen, setIsStandaloneModalOpen] = useState(false);
+  const [persistenceMode, setPersistenceMode] = useState<"file" | "kv" | "tmp">("file");
 
   // Per-browser / per-tab DM vs Player role & Follow-DM state (isolated via sessionStorage)
   const [isDmMode, setIsDmMode] = useState<boolean>(() => {
@@ -179,9 +183,16 @@ export default function App() {
   };
 
   const lastVersionRef = useRef<number>(0);
+  const stateRef = useRef<CampaignState | null>(null);
+  stateRef.current = state;
+  const pendingCharUpdatesRef = useRef<number>(0);
+  const charUpdateQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const applyIncomingCampaign = (nextCampaign: CampaignState | null | undefined, force = false) => {
     if (!nextCampaign) return;
+    if (!force && pendingCharUpdatesRef.current > 0) {
+      return;
+    }
     const incomingVer = typeof nextCampaign.stateVersion === "number" ? nextCampaign.stateVersion : 0;
     if (!force && incomingVer > 0 && incomingVer <= lastVersionRef.current) {
       return;
@@ -189,6 +200,7 @@ export default function App() {
     if (incomingVer > lastVersionRef.current || force) {
       lastVersionRef.current = incomingVer;
     }
+    stateRef.current = nextCampaign;
     setState(nextCampaign);
     if (nextCampaign.campaignName) {
       setCampaignNameInput((prev) => prev || nextCampaign.campaignName || "");
@@ -211,6 +223,7 @@ export default function App() {
   const [editCharLevel, setEditCharLevel] = useState<number>(1);
   const [editCharCurrentHp, setEditCharCurrentHp] = useState<number>(10);
   const [editCharMaxHp, setEditCharMaxHp] = useState<number>(10);
+  const [editCharIsHpHidden, setEditCharIsHpHidden] = useState<boolean>(false);
   const [editCharAvatarUrl, setEditCharAvatarUrl] = useState("");
   const [editCharStats, setEditCharStats] = useState({
     strength: 10,
@@ -256,13 +269,23 @@ export default function App() {
     }
   };
 
-  // Real-time WebSocket sync across browsers + auto-reconnect + gentle fallback fetch
+  // Real-time WebSocket sync on Node/local hosts, with automatic smart polling on Vercel/serverless hosts
   useEffect(() => {
     let isUnmounted = false;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let consecutiveWsFailures = 0;
+    let hasConnectedWs = false;
 
-    fetchCampaign(true);
+    const startPolling = (ms: number) => {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(() => {
+        if (!isUnmounted && !document.hidden) {
+          fetchCampaign(false);
+        }
+      }, ms);
+    };
 
     const connectWs = () => {
       if (isUnmounted) return;
@@ -271,9 +294,14 @@ export default function App() {
       try {
         ws = new WebSocket(wsUrl);
       } catch {
-        reconnectTimer = setTimeout(connectWs, 1500);
+        startPolling(2500);
         return;
       }
+
+      ws.onopen = () => {
+        hasConnectedWs = true;
+        consecutiveWsFailures = 0;
+      };
 
       ws.onmessage = (event) => {
         if (isUnmounted) return;
@@ -290,7 +318,15 @@ export default function App() {
 
       ws.onclose = () => {
         if (isUnmounted) return;
-        reconnectTimer = setTimeout(connectWs, 1500);
+        if (!hasConnectedWs) {
+          consecutiveWsFailures += 1;
+          if (consecutiveWsFailures >= 2) {
+            // Host does not support WebSockets (e.g., serverless); switch cleanly to fast HTTP polling
+            startPolling(2500);
+            return;
+          }
+        }
+        reconnectTimer = setTimeout(connectWs, 2000);
       };
 
       ws.onerror = () => {
@@ -302,16 +338,35 @@ export default function App() {
       };
     };
 
-    connectWs();
+    fetchCampaign(true);
 
-    const fallbackInterval = setInterval(() => {
-      fetchCampaign(false);
-    }, 15000);
+    (async () => {
+      try {
+        const res = await fetch("/api/health");
+        if (res.ok) {
+          const health = await res.json();
+          if (isUnmounted) return;
+          if (health?.persistence === "kv" || health?.persistence === "tmp" || health?.persistence === "file") {
+            setPersistenceMode(health.persistence);
+          }
+          if (health?.websocket === false) {
+            startPolling(2500);
+            return;
+          }
+        }
+      } catch {
+        // Proceed with WebSocket probe fallback
+      }
+      if (!isUnmounted) {
+        connectWs();
+        startPolling(15000);
+      }
+    })();
 
     return () => {
       isUnmounted = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      clearInterval(fallbackInterval);
+      if (pollTimer) clearInterval(pollTimer);
       try {
         ws?.close();
       } catch {
@@ -412,6 +467,46 @@ export default function App() {
       }
     } catch (err) {
       console.error("Save battle maps error:", err);
+    }
+  };
+
+  // Atomic Tactical Battle Token HP & Visibility Update (persists & records Damage/Heal logs)
+  const handleAdjustTokenHp = async (payload: {
+    locationId: string;
+    buildingId?: string;
+    mapId: string;
+    tokenId: string;
+    delta?: number;
+    setHp?: number;
+    isHpHidden?: boolean;
+  }): Promise<boolean> => {
+    try {
+      const res = await fetch("/api/campaign/location/battlemap/token-hp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
+        return true;
+      }
+    } catch (err) {
+      console.error("Token HP update error:", err);
+    }
+    return false;
+  };
+
+  // Clear recorded Damage / Heal logs
+  const handleClearHpLogs = async () => {
+    try {
+      const res = await fetch("/api/campaign/hp-logs/clear", { method: "POST" });
+      const data = await res.json();
+      if (data.success && data.campaign) {
+        applyIncomingCampaign(data.campaign);
+      }
+    } catch (err) {
+      console.error("Clear HP logs error:", err);
     }
   };
 
@@ -550,6 +645,7 @@ export default function App() {
     setEditCharLevel(char.level);
     setEditCharCurrentHp(char.hp.current);
     setEditCharMaxHp(char.hp.max);
+    setEditCharIsHpHidden(!!char.isHpHidden);
     setEditCharAvatarUrl(char.avatarUrl || "");
     setEditCharStats(char.stats || {
       strength: 10,
@@ -566,16 +662,22 @@ export default function App() {
     e.preventDefault();
     if (!editingCharacter) return;
 
+    const nextMaxHp = Math.max(1, Number(editCharMaxHp) || 10);
+    const nextCurrentHp = Math.max(0, Math.min(nextMaxHp, Number(editCharCurrentHp) || 0));
+
     const updatedChar: Character = {
       ...editingCharacter,
       name: editCharName.trim() || editingCharacter.name,
       className: editCharClass.trim() || editingCharacter.className,
       race: editCharRace.trim() || editingCharacter.race,
       level: Math.max(1, Number(editCharLevel) || 1),
-      hp: {
-        current: Math.max(0, Math.min(Number(editCharMaxHp), Number(editCharCurrentHp))),
-        max: Math.max(1, Number(editCharMaxHp) || 10)
-      },
+      hp: isDmMode || !editingCharacter.isHpHidden
+        ? {
+            current: nextCurrentHp,
+            max: nextMaxHp
+          }
+        : editingCharacter.hp,
+      isHpHidden: isDmMode ? editCharIsHpHidden : editingCharacter.isHpHidden,
       avatarUrl: editCharAvatarUrl,
       stats: editCharStats
     };
@@ -618,52 +720,81 @@ export default function App() {
     }
   };
 
-  // Persist quick status effect / exhaustion changes for a character
-  const persistQuickCharacterUpdate = async (updatedChar: Character) => {
-    setState((prev) =>
-      prev
-        ? {
-            ...prev,
-            characters: prev.characters.map((c) => (c.id === updatedChar.id ? updatedChar : c))
-          }
-        : prev
-    );
-    try {
-      const res = await fetch("/api/campaign/character", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updatedChar)
-      });
-      const data = await res.json();
-      if (data.success && data.campaign) {
-        applyIncomingCampaign(data.campaign);
-      }
-    } catch (err) {
-      console.error("Quick character update error:", err);
+  // Persist quick HP / visibility / status effect / exhaustion changes via serialized queue
+  const persistQuickCharacterUpdate = (charId: string, updater: (latest: Character) => Character | null) => {
+    const latestState = stateRef.current;
+    const target = latestState?.characters.find((c) => c.id === charId);
+    if (!target) return Promise.resolve();
+    const updatedChar = updater(target);
+    if (!updatedChar) return Promise.resolve();
+
+    if (stateRef.current) {
+      const nextLocalState: CampaignState = {
+        ...stateRef.current,
+        characters: stateRef.current.characters.map((c) => (c.id === charId ? updatedChar : c))
+      };
+      stateRef.current = nextLocalState;
+      setState(nextLocalState);
     }
+
+    pendingCharUpdatesRef.current += 1;
+    const task = charUpdateQueueRef.current.then(async () => {
+      try {
+        const res = await fetch("/api/campaign/character", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(updatedChar)
+        });
+        const data = await res.json();
+        pendingCharUpdatesRef.current = Math.max(0, pendingCharUpdatesRef.current - 1);
+        if (data.success && data.campaign && pendingCharUpdatesRef.current === 0) {
+          applyIncomingCampaign(data.campaign);
+        }
+      } catch (err) {
+        pendingCharUpdatesRef.current = Math.max(0, pendingCharUpdatesRef.current - 1);
+        console.error("Quick character update error:", err);
+      }
+    });
+    charUpdateQueueRef.current = task.catch(() => {});
+    return task;
   };
 
   const handleToggleStatusEffect = async (char: Character, rawEffect: string) => {
     const clean = rawEffect.trim();
     if (!clean) return;
-    const current = char.statusEffects || [];
-    const exists = current.some((s) => s.toLowerCase() === clean.toLowerCase());
-    const nextEffects = exists
-      ? current.filter((s) => s.toLowerCase() !== clean.toLowerCase())
-      : [...current, clean];
-    await persistQuickCharacterUpdate({
-      ...char,
-      statusEffects: nextEffects
+    await persistQuickCharacterUpdate(char.id, (latest) => {
+      const current = latest.statusEffects || [];
+      const exists = current.some((s) => s.toLowerCase() === clean.toLowerCase());
+      const nextEffects = exists
+        ? current.filter((s) => s.toLowerCase() !== clean.toLowerCase())
+        : [...current, clean];
+      return { ...latest, statusEffects: nextEffects };
     });
   };
 
   const handleAdjustExhaustion = async (char: Character, nextLevel: number) => {
     const clamped = Math.max(0, Math.min(6, nextLevel));
-    if (clamped === (char.exhaustionLevel || 0)) return;
-    await persistQuickCharacterUpdate({
-      ...char,
-      exhaustionLevel: clamped
+    await persistQuickCharacterUpdate(char.id, (latest) => {
+      if (clamped === (latest.exhaustionLevel || 0)) return null;
+      return { ...latest, exhaustionLevel: clamped };
     });
+  };
+
+  const handleAdjustCharacterHp = async (char: Character, delta: number) => {
+    await persistQuickCharacterUpdate(char.id, (latest) => {
+      if (!isDmMode && latest.isHpHidden) return null;
+      const nextHp = Math.max(0, Math.min(latest.hp.max, latest.hp.current + delta));
+      if (nextHp === latest.hp.current) return null;
+      return { ...latest, hp: { ...latest.hp, current: nextHp } };
+    });
+  };
+
+  const handleToggleCharacterHpHidden = async (char: Character) => {
+    if (!isDmMode) return;
+    await persistQuickCharacterUpdate(char.id, (latest) => ({
+      ...latest,
+      isHpHidden: !latest.isHpHidden
+    }));
   };
 
   // Character Avatar file upload (auto-optimized for portable JSON export)
@@ -845,6 +976,112 @@ export default function App() {
   const filteredNotes = noteFilter === "all" 
     ? state.notes 
     : state.notes.filter(n => n.category === noteFilter);
+
+  const isLogTargetHpHidden = (entry: CombatHpLogEntry): boolean => {
+    if (isDmMode) return false;
+    if (entry.characterId) {
+      const char = state.characters.find((c) => c.id === entry.characterId);
+      if (char) return !!char.isHpHidden;
+    }
+    const initMatch = state.initiativeOrder?.find((c) => c.id === entry.targetId);
+    if (initMatch && initMatch.isHpHidden !== undefined) {
+      return !!initMatch.isHpHidden;
+    }
+    for (const loc of state.locations) {
+      for (const m of loc.interiorMaps || []) {
+        const tok = m.tokens?.find((t) => t.id === entry.targetId);
+        if (tok && tok.isHpHidden !== undefined) return !!tok.isHpHidden;
+      }
+      for (const bld of loc.cityBuildings || []) {
+        for (const m of bld.interiorMaps || []) {
+          const tok = m.tokens?.find((t) => t.id === entry.targetId);
+          if (tok && tok.isHpHidden !== undefined) return !!tok.isHpHidden;
+        }
+      }
+    }
+    return entry.targetType !== "player";
+  };
+
+  const renderHpLogsCard = () => {
+    const logs = state.hpLogs || [];
+    return (
+      <div className="bg-[#0f1117] border border-white/10 rounded-xl p-4 space-y-3 shadow-lg">
+        <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
+          <div className="flex items-center gap-2">
+            <Heart className="w-4 h-4 text-red-400" />
+            <h3 className="text-xs font-bold uppercase tracking-widest text-slate-200 font-mono">
+              Damage & Heal Log
+            </h3>
+            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-slate-400 border border-white/5">
+              {logs.length}
+            </span>
+          </div>
+          {isDmMode && logs.length > 0 && (
+            <button
+              type="button"
+              onClick={handleClearHpLogs}
+              className="text-[10px] font-mono text-slate-400 hover:text-red-400 cursor-pointer"
+              title="Clear recorded combat HP history"
+            >
+              Clear Log
+            </button>
+          )}
+        </div>
+
+        {logs.length === 0 ? (
+          <p className="text-[11px] font-mono text-slate-500 italic py-4 text-center">
+            No damage or healing recorded yet. Every HP change across Battle Maps, Initiative, and Party Roster is logged here automatically.
+          </p>
+        ) : (
+          <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+            {logs.slice(0, 30).map((entry) => {
+              const isHeal = entry.delta > 0;
+              const hideNums = isLogTargetHpHidden(entry);
+              return (
+                <div
+                  key={entry.id}
+                  className={`px-2.5 py-2 rounded-lg border text-[11px] font-mono flex items-center justify-between gap-2 ${
+                    isHeal
+                      ? "bg-emerald-950/20 border-emerald-500/20"
+                      : "bg-red-950/20 border-red-500/20"
+                  }`}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="font-bold text-slate-100 truncate">{entry.targetName}</span>
+                      <span className="text-[9px] px-1 py-0.2 rounded bg-black/40 text-slate-400 border border-white/5 uppercase">
+                        {entry.targetType === "player" ? "Hero" : entry.targetType === "npc" ? "NPC" : "Enemy"}
+                      </span>
+                      {entry.context && (
+                        <span className="text-[9px] text-slate-500 truncate">• {entry.context}</span>
+                      )}
+                    </div>
+                    <div className="text-[10px] mt-0.5">
+                      {hideNums ? (
+                        <span className={isHeal ? "text-emerald-300/80" : "text-red-300/80"}>
+                          {isHeal ? "💚 Healed" : "⚔️ Damaged"} — 🔒 HP Hidden by DM
+                        </span>
+                      ) : (
+                        <span className={isHeal ? "text-emerald-300 font-bold" : "text-red-300 font-bold"}>
+                          {isHeal ? `💚 +${entry.delta} Heal` : `⚔️ ${entry.delta} Damage`}{" "}
+                          <span className="text-slate-400 font-normal">
+                            ({entry.previousHp} → {entry.newHp} / {entry.maxHp} HP)
+                          </span>
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <span className="text-[9px] text-slate-500 shrink-0">
+                    {new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="h-[100dvh] max-h-[100dvh] bg-[#0c0e12] text-[#d1d5db] font-sans flex flex-col overflow-hidden selection:bg-amber-500 selection:text-black">
@@ -1154,24 +1391,95 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Character health bars, status effects & exhaustion */}
-                  {char.id !== "dm" && (
-                    <div className="mt-2.5 space-y-2">
-                      <div className="space-y-1">
-                        <div className="flex justify-between text-[9px] font-mono text-slate-400">
-                          <span className="flex items-center gap-1">
-                            <Heart className="w-3 h-3 text-red-400" />
-                            Vitality
-                          </span>
-                          <span className="font-bold text-slate-200">{char.hp.current} / {char.hp.max} HP</span>
+                  {/* Character health bars, DM HP privacy toggle, quick damage/heal, status effects & exhaustion */}
+                  {char.id !== "dm" && (() => {
+                    const canViewHp = isDmMode || !char.isHpHidden;
+                    return (
+                      <div className="mt-2.5 space-y-2">
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between text-[9px] font-mono text-slate-400 gap-1">
+                            <span className="flex items-center gap-1">
+                              <Heart className="w-3 h-3 text-red-400" />
+                              Vitality
+                              {isDmMode && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleToggleCharacterHpHidden(char);
+                                  }}
+                                  className={`ml-1 px-1.5 py-0.5 rounded border text-[8px] uppercase inline-flex items-center gap-0.5 transition-all cursor-pointer ${
+                                    char.isHpHidden
+                                      ? "bg-amber-500/20 border-amber-500/50 text-amber-300 font-bold"
+                                      : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
+                                  }`}
+                                  title={char.isHpHidden ? "HP hidden from players — click to reveal" : "HP visible to players — click to hide"}
+                                >
+                                  {char.isHpHidden ? <EyeOff className="w-2.5 h-2.5" /> : <Eye className="w-2.5 h-2.5" />}
+                                  <span>{char.isHpHidden ? "Hidden" : "Shown"}</span>
+                                </button>
+                              )}
+                            </span>
+                            {canViewHp ? (
+                              <span className="font-bold text-slate-200">{char.hp.current} / {char.hp.max} HP</span>
+                            ) : (
+                              <span className="font-bold text-amber-400/80 flex items-center gap-1">
+                                <EyeOff className="w-2.5 h-2.5" />
+                                Hidden by DM
+                              </span>
+                            )}
+                          </div>
+
+                          {canViewHp ? (
+                            <>
+                              <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
+                                <div 
+                                  className={`h-full transition-all ${hpPercent > 50 ? "bg-amber-500" : hpPercent > 20 ? "bg-orange-500" : "bg-red-500"}`}
+                                  style={{ width: `${hpPercent}%` }}
+                                />
+                              </div>
+                              <div
+                                onClick={(e) => e.stopPropagation()}
+                                className="flex items-center justify-end gap-1 pt-0.5 text-[9px] font-mono"
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdjustCharacterHp(char, -5)}
+                                  className="px-1.5 py-0.5 bg-red-950/70 hover:bg-red-900 border border-red-500/30 text-red-300 rounded cursor-pointer"
+                                  title="Apply 5 damage"
+                                >
+                                  -5
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdjustCharacterHp(char, -1)}
+                                  className="px-1.5 py-0.5 bg-red-950/70 hover:bg-red-900 border border-red-500/30 text-red-300 rounded cursor-pointer"
+                                  title="Apply 1 damage"
+                                >
+                                  -1
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdjustCharacterHp(char, 1)}
+                                  className="px-1.5 py-0.5 bg-emerald-950/70 hover:bg-emerald-900 border border-emerald-500/30 text-emerald-300 rounded cursor-pointer"
+                                  title="Heal 1 HP"
+                                >
+                                  +1
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdjustCharacterHp(char, 5)}
+                                  className="px-1.5 py-0.5 bg-emerald-950/70 hover:bg-emerald-900 border border-emerald-500/30 text-emerald-300 rounded cursor-pointer"
+                                  title="Heal 5 HP"
+                                >
+                                  +5
+                                </button>
+                              </div>
+                            </>
+                          ) : (
+                            <div className="h-1.5 w-full bg-slate-800/80 rounded-full overflow-hidden border border-white/5" />
+                          )}
                         </div>
-                        <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
-                          <div 
-                            className={`h-full transition-all ${hpPercent > 50 ? "bg-amber-500" : hpPercent > 20 ? "bg-orange-500" : "bg-red-500"}`}
-                            style={{ width: `${hpPercent}%` }}
-                          />
-                        </div>
-                      </div>
 
                       {/* Status Effects Badges & Quick-Add Trigger */}
                       <div className="flex flex-wrap items-center gap-1 pt-0.5">
@@ -1359,8 +1667,9 @@ export default function App() {
                           </div>
                         );
                       })()}
-                    </div>
-                  )}
+                      </div>
+                    );
+                  })()}
 
                   {/* Easy Action Bar: Edit Character Button */}
                   <div className="mt-3 pt-2.5 border-t border-white/5 flex items-center justify-between text-[10px]">
@@ -1433,6 +1742,9 @@ export default function App() {
               onToggleDiscovered={handleToggleDiscovered}
               onCreateLocation={handleCreateLocation}
               onSaveBattleMaps={handleSaveBattleMaps}
+              onAdjustTokenHp={handleAdjustTokenHp}
+              hpLogs={state.hpLogs}
+              onClearHpLogs={handleClearHpLogs}
               onUpdateRegionImage={handleUpdateRegionImage}
               onUpdateLocation={handleUpdateLocation}
               onDeleteLocation={handleDeleteLocation}
@@ -1513,6 +1825,7 @@ export default function App() {
                       savedRound={state.initiativeRound}
                       savedTurnIndex={state.currentTurnIndex}
                       onSaveInitiative={handleSaveInitiative}
+                      isDmMode={isDmMode}
                     />
                   </div>
 
@@ -1527,6 +1840,7 @@ export default function App() {
                         onOpenInitiative={() => setDiceSubView("initiative")}
                       />
                     </div>
+                    {renderHpLogsCard()}
                   </div>
                 </div>
               )}
@@ -1543,6 +1857,7 @@ export default function App() {
                     savedRound={state.initiativeRound}
                     savedTurnIndex={state.currentTurnIndex}
                     onSaveInitiative={handleSaveInitiative}
+                    isDmMode={isDmMode}
                   />
                 </div>
               )}
@@ -1638,6 +1953,8 @@ export default function App() {
                       </button>
                     </form>
                   </div>
+
+                  {renderHpLogsCard()}
                 </div>
 
                 {/* Chronicle Journal List */}
@@ -1970,71 +2287,98 @@ export default function App() {
                       <label className="block text-2xs uppercase font-mono text-red-400 font-bold mb-1">
                         Current HP
                       </label>
-                      <input
-                        type="number"
-                        min={0}
-                        max={editCharMaxHp}
-                        value={editCharCurrentHp}
-                        onChange={(e) => setEditCharCurrentHp(parseInt(e.target.value) || 0)}
-                        className="w-full bg-[#1a1d2e] border border-red-500/40 text-red-300 p-1.5 rounded text-xs text-center font-mono font-bold"
-                      />
+                      {!isDmMode && editingCharacter.isHpHidden ? (
+                        <div className="w-full bg-[#1a1d2e] border border-amber-500/30 text-amber-400 p-1.5 rounded text-xs text-center font-mono font-bold">
+                          Hidden by DM
+                        </div>
+                      ) : (
+                        <input
+                          type="number"
+                          min={0}
+                          max={editCharMaxHp}
+                          value={editCharCurrentHp}
+                          onChange={(e) => setEditCharCurrentHp(parseInt(e.target.value) || 0)}
+                          className="w-full bg-[#1a1d2e] border border-red-500/40 text-red-300 p-1.5 rounded text-xs text-center font-mono font-bold"
+                        />
+                      )}
                     </div>
 
                     <div>
                       <label className="block text-2xs uppercase font-mono text-slate-400 font-bold mb-1">
                         Max HP
                       </label>
-                      <input
-                        type="number"
-                        min={1}
-                        value={editCharMaxHp}
-                        onChange={(e) => setEditCharMaxHp(parseInt(e.target.value) || 1)}
-                        className="w-full bg-[#1a1d2e] border border-white/10 text-white p-1.5 rounded text-xs text-center font-mono font-bold"
-                      />
+                      {!isDmMode && editingCharacter.isHpHidden ? (
+                        <div className="w-full bg-[#1a1d2e] border border-white/10 text-slate-500 p-1.5 rounded text-xs text-center font-mono font-bold">
+                          —
+                        </div>
+                      ) : (
+                        <input
+                          type="number"
+                          min={1}
+                          value={editCharMaxHp}
+                          onChange={(e) => setEditCharMaxHp(parseInt(e.target.value) || 1)}
+                          className="w-full bg-[#1a1d2e] border border-white/10 text-white p-1.5 rounded text-xs text-center font-mono font-bold"
+                        />
+                      )}
                     </div>
                   </div>
 
                   {/* Quick HP Adjustment Buttons */}
-                  <div className="flex items-center justify-between pt-1 text-3xs font-mono">
-                    <span className="text-slate-400">Quick Vitality:</span>
-                    <div className="flex gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setEditCharCurrentHp(prev => Math.max(0, prev - 5))}
-                        className="px-2 py-0.5 bg-red-950/80 hover:bg-red-900 border border-red-500/40 text-red-300 rounded cursor-pointer"
-                      >
-                        -5
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setEditCharCurrentHp(prev => Math.max(0, prev - 1))}
-                        className="px-2 py-0.5 bg-red-950/80 hover:bg-red-900 border border-red-500/40 text-red-300 rounded cursor-pointer"
-                      >
-                        -1
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setEditCharCurrentHp(prev => Math.min(editCharMaxHp, prev + 1))}
-                        className="px-2 py-0.5 bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-emerald-300 rounded cursor-pointer"
-                      >
-                        +1
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setEditCharCurrentHp(prev => Math.min(editCharMaxHp, prev + 5))}
-                        className="px-2 py-0.5 bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-emerald-300 rounded cursor-pointer"
-                      >
-                        +5
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setEditCharCurrentHp(editCharMaxHp)}
-                        className="px-2 py-0.5 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 rounded cursor-pointer font-bold"
-                      >
-                        Full
-                      </button>
+                  {(isDmMode || !editingCharacter.isHpHidden) && (
+                    <div className="flex items-center justify-between pt-1 text-3xs font-mono">
+                      <span className="text-slate-400">Quick Vitality:</span>
+                      <div className="flex gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setEditCharCurrentHp(prev => Math.max(0, prev - 5))}
+                          className="px-2 py-0.5 bg-red-950/80 hover:bg-red-900 border border-red-500/40 text-red-300 rounded cursor-pointer"
+                        >
+                          -5
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditCharCurrentHp(prev => Math.max(0, prev - 1))}
+                          className="px-2 py-0.5 bg-red-950/80 hover:bg-red-900 border border-red-500/40 text-red-300 rounded cursor-pointer"
+                        >
+                          -1
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditCharCurrentHp(prev => Math.min(editCharMaxHp, prev + 1))}
+                          className="px-2 py-0.5 bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-emerald-300 rounded cursor-pointer"
+                        >
+                          +1
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditCharCurrentHp(prev => Math.min(editCharMaxHp, prev + 5))}
+                          className="px-2 py-0.5 bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-500/40 text-emerald-300 rounded cursor-pointer"
+                        >
+                          +5
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditCharCurrentHp(editCharMaxHp)}
+                          className="px-2 py-0.5 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 rounded cursor-pointer font-bold"
+                        >
+                          Full
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  )}
+
+                  {isDmMode && editingCharacter.id !== "dm" && (
+                    <label className="flex items-center gap-2 pt-1.5 border-t border-white/5 text-[11px] font-mono text-amber-300 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={editCharIsHpHidden}
+                        onChange={(e) => setEditCharIsHpHidden(e.target.checked)}
+                        className="rounded bg-[#1a1d2e] border-white/20 text-amber-500 focus:ring-0"
+                      />
+                      <EyeOff className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Hide Health Points (HP) from Players (DM Only)</span>
+                    </label>
+                  )}
                 </div>
 
                 {/* Ability Scores (STR, DEX, CON, INT, WIS, CHA) */}
@@ -2186,6 +2530,7 @@ export default function App() {
         isOpen={isStandaloneModalOpen}
         onClose={() => setIsStandaloneModalOpen(false)}
         campaignState={state}
+        persistenceMode={persistenceMode}
         onImportCampaign={(newState) => {
           applyIncomingCampaign(newState, true);
           setCampaignNameInput(newState.campaignName || "Aethelgard");

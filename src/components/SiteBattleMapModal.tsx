@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { CampaignLocation, SiteBattleMap, MapToken, Character, LocationType, FogOfWarState } from "../types";
+import { CampaignLocation, SiteBattleMap, MapToken, Character, LocationType, FogOfWarState, CombatHpLogEntry } from "../types";
 import { 
   X, 
   Upload, 
@@ -33,7 +33,9 @@ import {
   PanelRightClose,
   PanelRightOpen,
   PanelTopClose,
-  PanelTopOpen
+  PanelTopOpen,
+  Flame,
+  Hourglass
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import FogOfWarOverlay from "./FogOfWarOverlay";
@@ -52,6 +54,17 @@ interface SiteBattleMapModalProps {
   savedImages?: ExtractedCampaignImage[];
   onClose: () => void;
   onSaveBattleMaps: (locationId: string, interiorMaps: SiteBattleMap[], activeInteriorMapId: string, buildingId?: string) => Promise<void>;
+  onAdjustTokenHp?: (payload: {
+    locationId: string;
+    buildingId?: string;
+    mapId: string;
+    tokenId: string;
+    delta?: number;
+    setHp?: number;
+    isHpHidden?: boolean;
+  }) => Promise<boolean>;
+  hpLogs?: CombatHpLogEntry[];
+  onClearHpLogs?: () => Promise<void>;
   onUpdateFog?: (payload: {
     targetType: "region" | "city" | "building" | "battlemap";
     regionId?: string;
@@ -114,6 +127,118 @@ const BATTLEMAP_PRESETS = [
   }
 ];
 
+interface EnvironmentEffectDraft {
+  name: string;
+  effectType: string;
+  effectIcon: string;
+  color: string;
+  areaRadius: number;
+  effectDuration?: number;
+  notes?: string;
+  isEffectHidden?: boolean;
+}
+
+const ENVIRONMENT_EFFECT_PRESETS: EnvironmentEffectDraft[] = [
+  {
+    name: "Poison Cloud",
+    effectType: "poison",
+    effectIcon: "☠️",
+    color: "#22c55e",
+    areaRadius: 1,
+    effectDuration: 10,
+    notes: "Heavily obscured. CON save vs poison damage when entering or starting turn inside."
+  },
+  {
+    name: "Burning Ground",
+    effectType: "fire",
+    effectIcon: "🔥",
+    color: "#f97316",
+    areaRadius: 1,
+    effectDuration: 10,
+    notes: "Wall / Area of Fire. DEX save or take fire damage upon entry or ending turn inside."
+  },
+  {
+    name: "Sleep Mist",
+    effectType: "sleep",
+    effectIcon: "💤",
+    color: "#a855f7",
+    areaRadius: 1,
+    effectDuration: 10,
+    notes: "Hypnotic / Sleep zone. Creatures in area roll HP threshold or WIS save vs unconscious/charmed."
+  },
+  {
+    name: "Entangling Web",
+    effectType: "web",
+    effectIcon: "🕸️",
+    color: "#cbd5e1",
+    areaRadius: 1,
+    effectDuration: 10,
+    notes: "Difficult terrain. DEX save on entry/turn start or become Restrained. Flammable."
+  },
+  {
+    name: "Darkness",
+    effectType: "darkness",
+    effectIcon: "🌑",
+    color: "#6366f1",
+    areaRadius: 1,
+    effectDuration: 10,
+    notes: "Magical Darkness. Heavily obscured; non-magical light & darkvision cannot pierce."
+  },
+  {
+    name: "Fog Cloud",
+    effectType: "fog",
+    effectIcon: "🌫️",
+    color: "#94a3b8",
+    areaRadius: 2,
+    effectDuration: 10,
+    notes: "Heavy obscurement. Creatures inside effectively suffer the Blinded condition."
+  },
+  {
+    name: "Ice Slick",
+    effectType: "ice",
+    effectIcon: "❄️",
+    color: "#38bdf8",
+    areaRadius: 1,
+    effectDuration: 10,
+    notes: "Grease / Sleet zone. Difficult terrain; DEX save on entry or fall Prone."
+  },
+  {
+    name: "Acid Pool",
+    effectType: "acid",
+    effectIcon: "🧪",
+    color: "#84cc16",
+    areaRadius: 0,
+    notes: "Corrosive hazard. Takes acid damage on contact or when starting turn in the tile."
+  },
+  {
+    name: "Storm Arc",
+    effectType: "lightning",
+    effectIcon: "⚡",
+    color: "#eab308",
+    areaRadius: 0,
+    effectDuration: 3,
+    notes: "Crackling storm aura. DEX save vs lightning damage when ending turn nearby."
+  },
+  {
+    name: "Healing Aura",
+    effectType: "healing",
+    effectIcon: "✨",
+    color: "#10b981",
+    areaRadius: 1,
+    effectDuration: 10,
+    notes: "Sanctuary / Aura of Vitality. Allies restore HP at start or end of turn."
+  },
+  {
+    name: "Silence Zone",
+    effectType: "silence",
+    effectIcon: "🔇",
+    color: "#ec4899",
+    areaRadius: 2,
+    effectDuration: 10,
+    notes: "No sound passes. Creatures inside are Deafened, immune to thunder, and cannot cast verbal spells."
+  }
+];
+
 export default function SiteBattleMapModal({
   location,
   buildingId,
@@ -126,6 +251,9 @@ export default function SiteBattleMapModal({
   savedImages = [],
   onClose,
   onSaveBattleMaps,
+  onAdjustTokenHp,
+  hpLogs = [],
+  onClearHpLogs,
   onUpdateFog
 }: SiteBattleMapModalProps) {
   // Determine initial maps or create default
@@ -159,12 +287,21 @@ export default function SiteBattleMapModal({
     return location.interiorMaps?.[0]?.id || interiorMaps[0]?.id || "map_default";
   });
 
+  // Authoritative live refs + serialized save queue so rapid HP edits and token moves NEVER race or overwrite each other
+  const interiorMapsRef = useRef<SiteBattleMap[]>(interiorMaps);
+  interiorMapsRef.current = interiorMaps;
+  const activeMapIdRef = useRef<string>(activeMapId);
+  activeMapIdRef.current = activeMapId;
+  const pendingSavesRef = useRef<number>(0);
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+
   // Current active map
   const activeMap = interiorMaps.find(m => m.id === activeMapId) || interiorMaps[0];
 
-  // Tool selection: 'select' | 'place-hero' | 'spawn-enemy' | 'ruler'
-  const [activeTool, setActiveTool] = useState<"select" | "place-hero" | "spawn-enemy" | "ruler">("select");
+  // Tool selection: 'select' | 'place-hero' | 'spawn-enemy' | 'place-effect' | 'ruler'
+  const [activeTool, setActiveTool] = useState<"select" | "place-hero" | "spawn-enemy" | "place-effect" | "ruler">("select");
   const [selectedHeroToPlace, setSelectedHeroToPlace] = useState<Character | null>(null);
+  const [selectedEffectToPlace, setSelectedEffectToPlace] = useState<EnvironmentEffectDraft | null>(null);
   const [selectedTokenId, setSelectedTokenId] = useState<string | null>(null);
 
   // Ruler state
@@ -264,16 +401,20 @@ export default function SiteBattleMapModal({
   };
 
   // Sync rooms, tokens, grid dimensions, and battle fog from real-time server updates
+  // Guarded by pendingSavesRef so in-flight serialized saves are never clobbered by intermediate responses
   useEffect(() => {
+    if (pendingSavesRef.current > 0) return;
     if (location.interiorMaps && location.interiorMaps.length > 0) {
+      interiorMapsRef.current = location.interiorMaps;
       setInteriorMaps(location.interiorMaps);
-      const activeStillExists = location.interiorMaps.some((m) => m.id === activeMapId);
+      const activeStillExists = location.interiorMaps.some((m) => m.id === activeMapIdRef.current);
       const nextId = activeStillExists
-        ? activeMapId
+        ? activeMapIdRef.current
         : (location.activeInteriorMapId && location.interiorMaps.some((m) => m.id === location.activeInteriorMapId)
             ? location.activeInteriorMapId
             : location.interiorMaps[0].id);
-      if (nextId !== activeMapId) {
+      if (nextId !== activeMapIdRef.current) {
+        activeMapIdRef.current = nextId;
         setActiveMapId(nextId);
       }
       if (!isSettingsOpen) {
@@ -296,6 +437,7 @@ export default function SiteBattleMapModal({
       location.activeInteriorMapId !== activeMapId &&
       location.interiorMaps?.some((m) => m.id === location.activeInteriorMapId)
     ) {
+      activeMapIdRef.current = location.activeInteriorMapId;
       setActiveMapId(location.activeInteriorMapId);
       setSelectedTokenId(null);
       setRulerStart(null);
@@ -307,6 +449,7 @@ export default function SiteBattleMapModal({
   const [fogBrushMode, setFogBrushMode] = useState<"off" | "reveal" | "hide">("off");
   const [fogBrushRadius, setFogBrushRadius] = useState<number>(12);
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState<boolean>(false);
+  const [customHpAmount, setCustomHpAmount] = useState<number>(5);
 
   // Custom Monster Spawner Modal state
   const [isCustomMonsterModalOpen, setIsCustomMonsterModalOpen] = useState(false);
@@ -315,7 +458,19 @@ export default function SiteBattleMapModal({
   const [customMonsterType, setCustomMonsterType] = useState<"enemy" | "npc">("enemy");
   const [customMonsterImageUrl, setCustomMonsterImageUrl] = useState("");
   const [customMonsterColor, setCustomMonsterColor] = useState("#ef4444");
+  const [customMonsterIsHpHidden, setCustomMonsterIsHpHidden] = useState<boolean>(true);
   const monsterFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Custom Environment Effect Modal state
+  const [isEffectModalOpen, setIsEffectModalOpen] = useState(false);
+  const [customEffectName, setCustomEffectName] = useState("Poison Cloud");
+  const [customEffectType, setCustomEffectType] = useState("poison");
+  const [customEffectIcon, setCustomEffectIcon] = useState("☠️");
+  const [customEffectColor, setCustomEffectColor] = useState("#22c55e");
+  const [customEffectRadius, setCustomEffectRadius] = useState<number>(1);
+  const [customEffectDuration, setCustomEffectDuration] = useState<string>("10");
+  const [customEffectNotes, setCustomEffectNotes] = useState("Heavily obscured. CON save vs poison damage when entering or starting turn inside.");
+  const [customEffectIsHidden, setCustomEffectIsHidden] = useState<boolean>(false);
 
   const MONSTER_PRESETS = [
     { name: "Goblin Raider", hp: 10, color: "#ef4444", avatarUrl: "https://images.unsplash.com/photo-1579783902614-a3fb3927b675?auto=format&fit=crop&q=80&w=300" },
@@ -326,18 +481,54 @@ export default function SiteBattleMapModal({
     { name: "Tavern Brawler", hp: 18, color: "#d97706", avatarUrl: "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&q=80&w=300" }
   ];
 
-  // Sync edits to parent and server
-  const saveChanges = async (updatedMaps: SiteBattleMap[], targetMapId = activeMapId) => {
-    setInteriorMaps(updatedMaps);
-    await onSaveBattleMaps(location.id, updatedMaps, targetMapId, buildingId);
+  // Enqueue atomic or full-map mutations using authoritative refs so rapid damage + token moves never revert each other
+  const enqueueMapMutation = (
+    mutator: (prevMaps: SiteBattleMap[], currentActiveId: string) => { maps: SiteBattleMap[]; nextActiveId?: string },
+    customRemoteSync?: (resolvedMaps: SiteBattleMap[], resolvedActiveId: string) => Promise<boolean>
+  ) => {
+    const currentActiveId = activeMapIdRef.current;
+    const { maps: nextMaps, nextActiveId } = mutator(interiorMapsRef.current, currentActiveId);
+    const resolvedActiveId = nextActiveId || currentActiveId;
+
+    interiorMapsRef.current = nextMaps;
+    activeMapIdRef.current = resolvedActiveId;
+    setInteriorMaps(nextMaps);
+    if (nextActiveId) {
+      setActiveMapId(nextActiveId);
+    }
+
+    pendingSavesRef.current += 1;
+    const task = saveQueueRef.current.then(async () => {
+      try {
+        if (customRemoteSync) {
+          const ok = await customRemoteSync(nextMaps, resolvedActiveId);
+          if (!ok) {
+            await onSaveBattleMaps(location.id, nextMaps, resolvedActiveId, buildingId);
+          }
+        } else {
+          await onSaveBattleMaps(location.id, nextMaps, resolvedActiveId, buildingId);
+        }
+      } finally {
+        pendingSavesRef.current = Math.max(0, pendingSavesRef.current - 1);
+      }
+    });
+    saveQueueRef.current = task.catch(() => {});
+    return task;
+  };
+
+  // Sync edits to parent and server (serialized through queue)
+  const saveChanges = async (updatedMaps: SiteBattleMap[], targetMapId = activeMapIdRef.current) => {
+    await enqueueMapMutation(() => ({
+      maps: updatedMaps,
+      nextActiveId: targetMapId
+    }));
   };
 
   // Update Fog of War on active battle map
   const handleUpdateBattleFog = async (nextFog: FogOfWarState) => {
-    const updatedMaps = interiorMaps.map((m) =>
-      m.id === activeMap.id ? { ...m, fogOfWar: nextFog } : m
-    );
-    await saveChanges(updatedMaps, activeMap.id);
+    await enqueueMapMutation((prevMaps, currentActiveId) => ({
+      maps: prevMaps.map((m) => (m.id === currentActiveId ? { ...m, fogOfWar: nextFog } : m))
+    }));
   };
 
   const handleToggleBattleFogOrOpen = async () => {
@@ -526,18 +717,22 @@ export default function SiteBattleMapModal({
 
   // Switch active map
   const handleSelectMap = (mapId: string) => {
+    activeMapIdRef.current = mapId;
     setActiveMapId(mapId);
     setSelectedTokenId(null);
     setRulerStart(null);
     setRulerEnd(null);
-    const target = interiorMaps.find(m => m.id === mapId);
+    const target = interiorMapsRef.current.find(m => m.id === mapId);
     if (target) {
       setEditName(target.name);
       setEditCols(target.gridCols);
       setEditRows(target.gridRows);
       setEditShowGrid(target.showGrid);
     }
-    saveChanges(interiorMaps, mapId);
+    enqueueMapMutation((prevMaps) => ({
+      maps: prevMaps,
+      nextActiveId: mapId
+    }));
   };
 
   // Add new interior map floor
@@ -546,82 +741,83 @@ export default function SiteBattleMapModal({
     const preset = BATTLEMAP_PRESETS.find(p => p.id === newMapPresetId) || BATTLEMAP_PRESETS[0];
     const safeCols = Math.max(4, Math.min(100, Number(newMapCols) || 14));
     const safeRows = Math.max(4, Math.min(100, Number(newMapRows) || 10));
-    const newMap: SiteBattleMap = {
-      id: "map_" + Date.now(),
-      locationId: location.id,
-      name: newMapName.trim() || `Level ${interiorMaps.length + 1} Chamber`,
-      description: `Interior sector of ${location.name}.`,
-      imageUrl: preset.url,
-      gridCols: safeCols,
-      gridRows: safeRows,
-      showGrid: true,
-      gridColor: "rgba(255, 255, 255, 0.18)",
-      tokens: []
-    };
-
-    const updated = [...interiorMaps, newMap];
+    const trimmedName = newMapName.trim();
     setIsAddMapOpen(false);
     setNewMapName("");
-    setActiveMapId(newMap.id);
-    await saveChanges(updated, newMap.id);
+
+    await enqueueMapMutation((prevMaps) => {
+      const newMap: SiteBattleMap = {
+        id: "map_" + Date.now(),
+        locationId: location.id,
+        name: trimmedName || `Level ${prevMaps.length + 1} Chamber`,
+        description: `Interior sector of ${location.name}.`,
+        imageUrl: preset.url,
+        gridCols: safeCols,
+        gridRows: safeRows,
+        showGrid: true,
+        gridColor: "rgba(255, 255, 255, 0.18)",
+        tokens: []
+      };
+      return {
+        maps: [...prevMaps, newMap],
+        nextActiveId: newMap.id
+      };
+    });
   };
 
   // Delete or reset current interior map (in-app confirm, no window.confirm)
   const handleDeleteCurrentMap = async () => {
     setIsDeleteConfirmOpen(false);
-    if (interiorMaps.length <= 1) {
-      const fresh = [getDefaultMap()];
-      setActiveMapId(fresh[0].id);
-      await saveChanges(fresh, fresh[0].id);
-      return;
-    }
-
-    const updated = interiorMaps.filter(m => m.id !== activeMap.id);
-    const nextActiveId = updated[0].id;
-    setActiveMapId(nextActiveId);
-    await saveChanges(updated, nextActiveId);
+    await enqueueMapMutation((prevMaps, currentActiveId) => {
+      if (prevMaps.length <= 1) {
+        const fresh = [getDefaultMap()];
+        return { maps: fresh, nextActiveId: fresh[0].id };
+      }
+      const updated = prevMaps.filter(m => m.id !== currentActiveId);
+      return { maps: updated, nextActiveId: updated[0].id };
+    });
   };
 
   // Save map settings
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    const updated = interiorMaps.map(m => {
-      if (m.id === activeMap.id) {
-        const nextCols = Math.max(4, Math.min(100, Number(editCols) || 12));
-        const nextRows = Math.max(4, Math.min(100, Number(editRows) || 10));
-        // Clamp existing tokens so none end up outside reduced grid bounds
-        const clampedTokens = m.tokens.map(t => ({
-          ...t,
-          x: Math.min(nextCols - 1, Math.max(0, t.x)),
-          y: Math.min(nextRows - 1, Math.max(0, t.y))
-        }));
-        return {
-          ...m,
-          name: editName.trim() || m.name,
-          gridCols: nextCols,
-          gridRows: nextRows,
-          showGrid: editShowGrid,
-          tokens: clampedTokens
-        };
-      }
-      return m;
-    });
+    const nextCols = Math.max(4, Math.min(100, Number(editCols) || 12));
+    const nextRows = Math.max(4, Math.min(100, Number(editRows) || 10));
+    const nextName = editName.trim();
+    const nextShowGrid = editShowGrid;
     setIsSettingsOpen(false);
-    await saveChanges(updated);
+
+    await enqueueMapMutation((prevMaps, currentActiveId) => ({
+      maps: prevMaps.map(m => {
+        if (m.id === currentActiveId) {
+          const clampedTokens = m.tokens.map(t => ({
+            ...t,
+            x: Math.min(nextCols - 1, Math.max(0, t.x)),
+            y: Math.min(nextRows - 1, Math.max(0, t.y))
+          }));
+          return {
+            ...m,
+            name: nextName || m.name,
+            gridCols: nextCols,
+            gridRows: nextRows,
+            showGrid: nextShowGrid,
+            tokens: clampedTokens
+          };
+        }
+        return m;
+      })
+    }));
   };
 
   // Apply Imported Image (from URL or file upload)
   const handleApplyImage = async (url: string) => {
-    if (!url.trim()) return;
-    const updated = interiorMaps.map(m => {
-      if (m.id === activeMap.id) {
-        return { ...m, imageUrl: url.trim() };
-      }
-      return m;
-    });
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl) return;
     setUrlInput("");
     setIsImageImporterOpen(false);
-    await saveChanges(updated);
+    await enqueueMapMutation((prevMaps, currentActiveId) => ({
+      maps: prevMaps.map(m => (m.id === currentActiveId ? { ...m, imageUrl: trimmedUrl } : m))
+    }));
   };
 
   // Handle Local File Upload (auto-optimizes large images for fast JSON save/load)
@@ -638,7 +834,22 @@ export default function SiteBattleMapModal({
     }
   };
 
+  // Helper: Determine if a token's HP is hidden from players (checks both token flag and linked hero flag)
+  const isTokenHpHidden = (token: MapToken): boolean => {
+    if (token.isHpHidden !== undefined) return !!token.isHpHidden;
+    if (token.characterId) {
+      const linked = characters.find((c) => c.id === token.characterId);
+      if (linked) return !!linked.isHpHidden;
+    }
+    return false;
+  };
+
+  const canViewTokenHp = (token: MapToken): boolean => {
+    return effectiveDmMode || !isTokenHpHidden(token);
+  };
+
   // Click on a Grid Cell (handles placement, token movement, ruler)
+  // Always mutates from interiorMapsRef.current through serialized queue so token HP/notes NEVER revert when moving!
   const handleCellClick = async (x: number, y: number) => {
     // 1. If in Ruler mode:
     if (activeTool === "ruler") {
@@ -651,55 +862,87 @@ export default function SiteBattleMapModal({
       return;
     }
 
+    const currentMaps = interiorMapsRef.current;
+    const currentMap = currentMaps.find((m) => m.id === activeMapIdRef.current) || currentMaps[0];
+    if (!currentMap) return;
+
     // 2. If placing a hero from party:
     if (activeTool === "place-hero" && selectedHeroToPlace) {
-      // Check if this hero is already on map; if so, move them to this cell!
-      const existingToken = activeMap.tokens.find(t => t.characterId === selectedHeroToPlace.id);
-      let updatedTokens: MapToken[];
-
-      if (existingToken) {
-        updatedTokens = activeMap.tokens.map(t => 
-          t.id === existingToken.id ? { ...t, x, y } : t
-        );
-      } else {
-        const newToken: MapToken = {
-          id: "token_" + Date.now(),
-          name: selectedHeroToPlace.name,
-          characterId: selectedHeroToPlace.id,
-          avatarUrl: selectedHeroToPlace.avatarUrl,
-          type: "player",
-          x,
-          y,
-          hp: selectedHeroToPlace.hp ? { current: selectedHeroToPlace.hp.current, max: selectedHeroToPlace.hp.max } : undefined
-        };
-        updatedTokens = [...activeMap.tokens, newToken];
-      }
-
-      const updatedMaps = interiorMaps.map(m => m.id === activeMap.id ? { ...m, tokens: updatedTokens } : m);
+      const heroToPlace = selectedHeroToPlace;
       setSelectedHeroToPlace(null);
       setActiveTool("select");
-      await saveChanges(updatedMaps);
+
+      await enqueueMapMutation((prevMaps, curActiveId) => ({
+        maps: prevMaps.map((m) => {
+          if (m.id !== curActiveId) return m;
+          const existingToken = m.tokens.find((t) => t.characterId === heroToPlace.id);
+          const updatedTokens: MapToken[] = existingToken
+            ? m.tokens.map((t) => (t.id === existingToken.id ? { ...t, x, y } : t))
+            : [
+                ...m.tokens,
+                {
+                  id: "token_" + Date.now(),
+                  name: heroToPlace.name,
+                  characterId: heroToPlace.id,
+                  avatarUrl: heroToPlace.avatarUrl,
+                  type: "player",
+                  x,
+                  y,
+                  hp: heroToPlace.hp ? { current: heroToPlace.hp.current, max: heroToPlace.hp.max } : undefined,
+                  isHpHidden: heroToPlace.isHpHidden
+                }
+              ];
+          return { ...m, tokens: updatedTokens };
+        })
+      }));
+      return;
+    }
+
+    // 2b. If placing an Environment Effect / Spell AoE token:
+    if (activeTool === "place-effect" && selectedEffectToPlace) {
+      const effectDraft = selectedEffectToPlace;
+      setSelectedEffectToPlace(null);
+      setActiveTool("select");
+      await handleSpawnEffectAt(effectDraft, x, y);
       return;
     }
 
     // 3. If moving an already-selected token to a new cell:
     if (selectedTokenId) {
-      const token = activeMap.tokens.find(t => t.id === selectedTokenId);
+      const movingId = selectedTokenId;
+      const token = currentMap.tokens.find((t) => t.id === movingId);
       if (token && (token.x !== x || token.y !== y)) {
-        const updatedTokens = activeMap.tokens.map(t => 
-          t.id === selectedTokenId ? { ...t, x, y } : t
-        );
-        const updatedMaps = interiorMaps.map(m => m.id === activeMap.id ? { ...m, tokens: updatedTokens } : m);
         setSelectedTokenId(null);
-        await saveChanges(updatedMaps);
+        await enqueueMapMutation((prevMaps, curActiveId) => ({
+          maps: prevMaps.map((m) => {
+            if (m.id !== curActiveId) return m;
+            return {
+              ...m,
+              tokens: m.tokens.map((t) => (t.id === movingId ? { ...t, x, y } : t))
+            };
+          })
+        }));
         return;
       }
     }
 
-    // 4. Default: If clicking a cell that has a token, select that token
-    const tokenAtCell = activeMap.tokens.find(t => t.x === x && t.y === y);
-    if (tokenAtCell) {
-      setSelectedTokenId(tokenAtCell.id);
+    // 4. Default: Prioritize unit tokens on this square, then visible environment effect zones covering this square
+    const unitAtCell = currentMap.tokens.find((t) => t.type !== "effect" && t.x === x && t.y === y);
+    if (unitAtCell) {
+      setSelectedTokenId(unitAtCell.id);
+      return;
+    }
+
+    const visibleEffects = currentMap.tokens.filter(
+      (t) => t.type === "effect" && (effectiveDmMode || (!t.isEffectHidden && isCellVisibleToPlayers(t.x, t.y)))
+    );
+    const effectAtCenter = visibleEffects.find((t) => t.x === x && t.y === y);
+    const effectCoveringCell = visibleEffects.find(
+      (t) => Math.abs(t.x - x) <= (t.areaRadius || 0) && Math.abs(t.y - y) <= (t.areaRadius || 0)
+    );
+    const matchedEffect = effectAtCenter || effectCoveringCell;
+    if (matchedEffect) {
+      setSelectedTokenId(matchedEffect.id);
     } else {
       setSelectedTokenId(null);
     }
@@ -707,62 +950,65 @@ export default function SiteBattleMapModal({
 
   // Deploy All Party Members to map entrance (bottom-left area)
   const handleDeployAllParty = async () => {
-    const existingCharIds = new Set(activeMap.tokens.map(t => t.characterId).filter(Boolean));
-    const newTokens: MapToken[] = [];
-    let startX = 1;
-    let startY = activeMap.gridRows - 2;
+    await enqueueMapMutation((prevMaps, curActiveId) => ({
+      maps: prevMaps.map((m) => {
+        if (m.id !== curActiveId) return m;
+        const existingCharIds = new Set(m.tokens.map((t) => t.characterId).filter(Boolean));
+        const newTokens: MapToken[] = [];
+        let startX = 1;
+        let startY = m.gridRows - 2;
 
-    characters.forEach((char) => {
-      if (char.id === "dm" && characters.length > 1) return;
-      if (!existingCharIds.has(char.id)) {
-        newTokens.push({
-          id: "token_" + char.id + "_" + Date.now(),
-          name: char.name,
-          characterId: char.id,
-          avatarUrl: char.avatarUrl,
-          type: "player",
-          x: Math.min(activeMap.gridCols - 1, startX),
-          y: Math.max(0, startY),
-          hp: char.hp ? { current: char.hp.current, max: char.hp.max } : undefined
+        characters.forEach((char) => {
+          if (char.id === "dm" && characters.length > 1) return;
+          if (!existingCharIds.has(char.id)) {
+            newTokens.push({
+              id: "token_" + char.id + "_" + Date.now(),
+              name: char.name,
+              characterId: char.id,
+              avatarUrl: char.avatarUrl,
+              type: "player",
+              x: Math.min(m.gridCols - 1, startX),
+              y: Math.max(0, startY),
+              hp: char.hp ? { current: char.hp.current, max: char.hp.max } : undefined,
+              isHpHidden: char.isHpHidden
+            });
+            startX++;
+            if (startX > 4) {
+              startX = 1;
+              startY--;
+            }
+          }
         });
-        startX++;
-        if (startX > 4) {
-          startX = 1;
-          startY--;
-        }
-      }
-    });
 
-    const updatedTokens = [...activeMap.tokens, ...newTokens];
-    const updatedMaps = interiorMaps.map(m => m.id === activeMap.id ? { ...m, tokens: updatedTokens } : m);
-    await saveChanges(updatedMaps);
+        return { ...m, tokens: [...m.tokens, ...newTokens] };
+      })
+    }));
   };
 
-  // Quick Spawn Monster / Adversary Token onto Map
+  // Quick Spawn Monster / Adversary Token onto Map (HP defaults to hidden from players)
   const handleSpawnEnemy = async (name: string, hp = 15, color = "#ef4444") => {
-    // Find an empty cell near the top center
-    let placedX = Math.floor(activeMap.gridCols / 2);
-    let placedY = 2;
-
-    // Shift if occupied
-    while (activeMap.tokens.some(t => t.x === placedX && t.y === placedY) && placedY < activeMap.gridRows - 1) {
-      placedX = (placedX + 1) % activeMap.gridCols;
-      if (placedX === 0) placedY++;
-    }
-
-    const newEnemy: MapToken = {
-      id: "enemy_" + Date.now(),
-      name,
-      type: "enemy",
-      x: placedX,
-      y: placedY,
-      color,
-      hp: { current: hp, max: hp }
-    };
-
-    const updatedTokens = [...activeMap.tokens, newEnemy];
-    const updatedMaps = interiorMaps.map(m => m.id === activeMap.id ? { ...m, tokens: updatedTokens } : m);
-    await saveChanges(updatedMaps);
+    await enqueueMapMutation((prevMaps, curActiveId) => ({
+      maps: prevMaps.map((m) => {
+        if (m.id !== curActiveId) return m;
+        let placedX = Math.floor(m.gridCols / 2);
+        let placedY = 2;
+        while (m.tokens.some((t) => t.x === placedX && t.y === placedY) && placedY < m.gridRows - 1) {
+          placedX = (placedX + 1) % m.gridCols;
+          if (placedX === 0) placedY++;
+        }
+        const newEnemy: MapToken = {
+          id: "enemy_" + Date.now(),
+          name,
+          type: "enemy",
+          x: placedX,
+          y: placedY,
+          color,
+          hp: { current: hp, max: hp },
+          isHpHidden: true
+        };
+        return { ...m, tokens: [...m.tokens, newEnemy] };
+      })
+    }));
   };
 
   // Handle Monster Token Picture File Upload
@@ -784,49 +1030,202 @@ export default function SiteBattleMapModal({
     if (e) e.preventDefault();
     if (!customMonsterName.trim()) return;
 
-    let placedX = Math.floor(activeMap.gridCols / 2);
-    let placedY = 2;
-    while (activeMap.tokens.some(t => t.x === placedX && t.y === placedY) && placedY < activeMap.gridRows - 1) {
-      placedX = (placedX + 1) % activeMap.gridCols;
-      if (placedX === 0) placedY++;
-    }
-
-    const newToken: MapToken = {
-      id: "monster_" + Date.now(),
+    const tokenDraft = {
       name: customMonsterName.trim(),
       type: customMonsterType,
       avatarUrl: customMonsterImageUrl.trim() || undefined,
       color: customMonsterColor,
-      x: placedX,
-      y: placedY,
-      hp: { current: customMonsterHp, max: customMonsterHp }
+      hp: { current: customMonsterHp, max: customMonsterHp },
+      isHpHidden: customMonsterIsHpHidden
     };
-
-    const updatedTokens = [...activeMap.tokens, newToken];
-    const updatedMaps = interiorMaps.map(m => m.id === activeMap.id ? { ...m, tokens: updatedTokens } : m);
     setIsCustomMonsterModalOpen(false);
-    await saveChanges(updatedMaps);
+
+    await enqueueMapMutation((prevMaps, curActiveId) => ({
+      maps: prevMaps.map((m) => {
+        if (m.id !== curActiveId) return m;
+        let placedX = Math.floor(m.gridCols / 2);
+        let placedY = 2;
+        while (m.tokens.some((t) => t.x === placedX && t.y === placedY) && placedY < m.gridRows - 1) {
+          placedX = (placedX + 1) % m.gridCols;
+          if (placedX === 0) placedY++;
+        }
+        const newToken: MapToken = {
+          id: "monster_" + Date.now(),
+          ...tokenDraft,
+          x: placedX,
+          y: placedY
+        };
+        return { ...m, tokens: [...m.tokens, newToken] };
+      })
+    }));
+  };
+
+  // Spawn an Environment Effect / Spell AoE Token at specific coordinates
+  const handleSpawnEffectAt = async (draft: EnvironmentEffectDraft, x: number, y: number) => {
+    const newId = "effect_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
+    await enqueueMapMutation((prevMaps, curActiveId) => ({
+      maps: prevMaps.map((m) => {
+        if (m.id !== curActiveId) return m;
+        const boundedX = Math.max(0, Math.min(m.gridCols - 1, x));
+        const boundedY = Math.max(0, Math.min(m.gridRows - 1, y));
+        const newEffect: MapToken = {
+          id: newId,
+          name: draft.name,
+          type: "effect",
+          x: boundedX,
+          y: boundedY,
+          color: draft.color,
+          effectType: draft.effectType,
+          effectIcon: draft.effectIcon,
+          areaRadius: draft.areaRadius,
+          effectDuration: draft.effectDuration,
+          isEffectHidden: draft.isEffectHidden,
+          notes: draft.notes
+        };
+        return { ...m, tokens: [...m.tokens, newEffect] };
+      })
+    }));
+    setSelectedTokenId(newId);
+  };
+
+  // Spawn an Environment Effect at the center of the active tactical grid
+  const handleSpawnEffectAtCenter = async (draft: EnvironmentEffectDraft) => {
+    const curMap = interiorMapsRef.current.find((m) => m.id === activeMapIdRef.current) || activeMap;
+    const cx = Math.floor((curMap?.gridCols || 14) / 2);
+    const cy = Math.floor((curMap?.gridRows || 10) / 2);
+    await handleSpawnEffectAt(draft, cx, cy);
+  };
+
+  // Update Environment Effect token properties (radius, duration, notes, DM hidden trap toggle)
+  const handleUpdateEffectProps = async (
+    tokenId: string,
+    patch: Partial<Pick<MapToken, "areaRadius" | "effectDuration" | "isEffectHidden" | "notes" | "name" | "color" | "effectIcon">>
+  ) => {
+    await enqueueMapMutation((prevMaps, curActiveId) => ({
+      maps: prevMaps.map((m) => {
+        if (m.id !== curActiveId) return m;
+        return {
+          ...m,
+          tokens: m.tokens.map((t) => (t.id === tokenId ? { ...t, ...patch } : t))
+        };
+      })
+    }));
+  };
+
+  // Advance / Tick down round duration across all timed Environment Effects on this map
+  const handleTickAllEffectDurations = async () => {
+    await enqueueMapMutation((prevMaps, curActiveId) => ({
+      maps: prevMaps.map((m) => {
+        if (m.id !== curActiveId) return m;
+        return {
+          ...m,
+          tokens: m.tokens.map((t) => {
+            if (t.type !== "effect" || t.effectDuration === undefined) return t;
+            return { ...t, effectDuration: Math.max(0, t.effectDuration - 1) };
+          })
+        };
+      })
+    }));
   };
 
   // Delete token from map
   const handleDeleteToken = async (tokenId: string) => {
-    const updatedTokens = activeMap.tokens.filter(t => t.id !== tokenId);
-    const updatedMaps = interiorMaps.map(m => m.id === activeMap.id ? { ...m, tokens: updatedTokens } : m);
     if (selectedTokenId === tokenId) setSelectedTokenId(null);
-    await saveChanges(updatedMaps);
+    await enqueueMapMutation((prevMaps, curActiveId) => ({
+      maps: prevMaps.map((m) =>
+        m.id === curActiveId
+          ? { ...m, tokens: m.tokens.filter((t) => t.id !== tokenId) }
+          : m
+      )
+    }));
   };
 
-  // Adjust token HP
+  // Adjust token HP via serialized atomic queue (persists, logs Damage/Heal, and never collides with token moves)
   const handleTokenHpDelta = async (tokenId: string, delta: number) => {
-    const updatedTokens = activeMap.tokens.map(t => {
-      if (t.id === tokenId && t.hp) {
-        const newHp = Math.max(0, Math.min(t.hp.max, t.hp.current + delta));
-        return { ...t, hp: { ...t.hp, current: newHp } };
-      }
-      return t;
-    });
-    const updatedMaps = interiorMaps.map(m => m.id === activeMap.id ? { ...m, tokens: updatedTokens } : m);
-    await saveChanges(updatedMaps);
+    const curMap = interiorMapsRef.current.find((m) => m.id === activeMapIdRef.current) || activeMap;
+    const targetTok = curMap?.tokens.find((t) => t.id === tokenId);
+    if (!targetTok || (!effectiveDmMode && isTokenHpHidden(targetTok))) return;
+
+    await enqueueMapMutation(
+      (prevMaps, curActiveId) => ({
+        maps: prevMaps.map((m) => {
+          if (m.id !== curActiveId) return m;
+          return {
+            ...m,
+            tokens: m.tokens.map((t) => {
+              if (t.id === tokenId && t.hp) {
+                const newHp = Math.max(0, Math.min(t.hp.max, t.hp.current + delta));
+                return { ...t, hp: { ...t.hp, current: newHp } };
+              }
+              return t;
+            })
+          };
+        })
+      }),
+      onAdjustTokenHp
+        ? async (_resolvedMaps, resolvedActiveId) =>
+            onAdjustTokenHp({
+              locationId: location.id,
+              buildingId,
+              mapId: resolvedActiveId,
+              tokenId,
+              delta
+            })
+        : undefined
+    );
+  };
+
+  // Toggle individual token HP visibility (DM Only)
+  const handleToggleTokenHpHidden = async (tokenId: string) => {
+    if (!effectiveDmMode) return;
+    const curMap = interiorMapsRef.current.find((m) => m.id === activeMapIdRef.current) || activeMap;
+    const targetTok = curMap?.tokens.find((t) => t.id === tokenId);
+    if (!targetTok) return;
+    const nextHidden = !isTokenHpHidden(targetTok);
+
+    await enqueueMapMutation(
+      (prevMaps, curActiveId) => ({
+        maps: prevMaps.map((m) => {
+          if (m.id !== curActiveId) return m;
+          return {
+            ...m,
+            tokens: m.tokens.map((t) => (t.id === tokenId ? { ...t, isHpHidden: nextHidden } : t))
+          };
+        })
+      }),
+      onAdjustTokenHp
+        ? async (_resolvedMaps, resolvedActiveId) =>
+            onAdjustTokenHp({
+              locationId: location.id,
+              buildingId,
+              mapId: resolvedActiveId,
+              tokenId,
+              isHpHidden: nextHidden
+            })
+        : undefined
+    );
+  };
+
+  // Bulk hide/show enemy & NPC HP or all tokens (DM Only)
+  const handleBulkSetTokenHpVisibility = async (mode: "hide-non-players" | "show-all") => {
+    if (!effectiveDmMode) return;
+    await enqueueMapMutation((prevMaps, curActiveId) => ({
+      maps: prevMaps.map((m) => {
+        if (m.id !== curActiveId) return m;
+        return {
+          ...m,
+          tokens: m.tokens.map((t) => {
+            if (mode === "hide-non-players" && t.type !== "player") {
+              return { ...t, isHpHidden: true };
+            }
+            if (mode === "show-all") {
+              return { ...t, isHpHidden: false };
+            }
+            return t;
+          })
+        };
+      })
+    }));
   };
 
   // Calculate Ruler Distance
@@ -840,7 +1239,13 @@ export default function SiteBattleMapModal({
   };
 
   const rawSelectedToken = activeMap.tokens.find(t => t.id === selectedTokenId);
-  const selectedToken = rawSelectedToken && (effectiveDmMode || rawSelectedToken.type === "player" || isCellVisibleToPlayers(rawSelectedToken.x, rawSelectedToken.y))
+  const selectedToken = rawSelectedToken && (
+    effectiveDmMode ||
+    rawSelectedToken.type === "player" ||
+    (rawSelectedToken.type === "effect"
+      ? !rawSelectedToken.isEffectHidden && isCellVisibleToPlayers(rawSelectedToken.x, rawSelectedToken.y)
+      : isCellVisibleToPlayers(rawSelectedToken.x, rawSelectedToken.y))
+  )
     ? rawSelectedToken
     : undefined;
 
@@ -1200,6 +1605,7 @@ export default function SiteBattleMapModal({
               onClick={() => {
                 setActiveTool("select");
                 setSelectedHeroToPlace(null);
+                setSelectedEffectToPlace(null);
                 setRulerStart(null);
                 setRulerEnd(null);
               }}
@@ -1219,6 +1625,7 @@ export default function SiteBattleMapModal({
                 setActiveTool("ruler");
                 setSelectedTokenId(null);
                 setSelectedHeroToPlace(null);
+                setSelectedEffectToPlace(null);
                 setRulerStart(null);
                 setRulerEnd(null);
               }}
@@ -1235,8 +1642,9 @@ export default function SiteBattleMapModal({
             {/* Grid Visibility Toggle */}
             <button
               onClick={() => {
-                const updated = interiorMaps.map(m => m.id === activeMap.id ? { ...m, showGrid: !m.showGrid } : m);
-                saveChanges(updated);
+                enqueueMapMutation((prevMaps, currentActiveId) => ({
+                  maps: prevMaps.map(m => (m.id === currentActiveId ? { ...m, showGrid: !m.showGrid } : m))
+                }));
               }}
               className={`p-1 rounded text-3xs font-mono uppercase transition-all ${
                 activeMap.showGrid ? "text-amber-400" : "text-slate-500"
@@ -1304,9 +1712,47 @@ export default function SiteBattleMapModal({
               </div>
             )}
 
-            {selectedTokenId && (
+            {activeTool === "place-effect" && selectedEffectToPlace && (
+              <div
+                style={{ borderColor: selectedEffectToPlace.color }}
+                className="bg-[#141622]/95 border-2 text-slate-100 px-3 py-1 rounded-xl font-mono text-2xs font-bold shadow-lg flex items-center space-x-2"
+              >
+                <span>
+                  {selectedEffectToPlace.effectIcon} Click square to cast{" "}
+                  <strong className="text-amber-300">{selectedEffectToPlace.name}</strong> (
+                  {((selectedEffectToPlace.areaRadius || 0) * 2 + 1) * 5}ft)
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const draft = selectedEffectToPlace;
+                    setSelectedEffectToPlace(null);
+                    setActiveTool("select");
+                    handleSpawnEffectAtCenter(draft);
+                  }}
+                  className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/35 text-amber-300 border border-amber-500/40 text-3xs cursor-pointer"
+                >
+                  Center
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedEffectToPlace(null);
+                    setActiveTool("select");
+                  }}
+                  className="ml-1 text-slate-400 hover:text-white cursor-pointer"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            {selectedTokenId && selectedToken && (
               <div className="bg-[#141622]/95 border border-amber-500/40 text-amber-300 px-3 py-1 rounded-xl font-mono text-2xs shadow-lg flex items-center space-x-2">
-                <span>Token Selected: <strong className="text-white">{selectedToken?.name}</strong></span>
+                <span>
+                  {selectedToken.type === "effect" ? `${selectedToken.effectIcon || "✨"} Effect:` : "Token Selected:"}{" "}
+                  <strong className="text-white">{selectedToken.name}</strong>
+                </span>
                 <span className="text-slate-400 text-3xs">• Click another cell to move</span>
                 <button
                   onClick={() => setSelectedTokenId(null)}
@@ -1399,8 +1845,27 @@ export default function SiteBattleMapModal({
                       />
                     )}
 
-                    {/* Hover Cell Highlight */}
-                    {hoverCell && (
+                    {/* Hover Cell / Environment AoE Preview Highlight */}
+                    {hoverCell && activeTool === "place-effect" && selectedEffectToPlace ? (() => {
+                      const rad = selectedEffectToPlace.areaRadius || 0;
+                      const spanCells = rad * 2 + 1;
+                      return (
+                        <div
+                          style={{
+                            left: `${((hoverCell.x + 0.5) / activeMap.gridCols) * 100}%`,
+                            top: `${((hoverCell.y + 0.5) / activeMap.gridRows) * 100}%`,
+                            width: `${(spanCells / activeMap.gridCols) * 100}%`,
+                            height: `${(spanCells / activeMap.gridRows) * 100}%`,
+                            transform: "translate(-50%, -50%)",
+                            backgroundColor: `${selectedEffectToPlace.color}33`,
+                            borderColor: selectedEffectToPlace.color
+                          }}
+                          className="absolute z-[16] rounded-lg border-2 border-dashed flex items-center justify-center pointer-events-none"
+                        >
+                          <span className="text-lg drop-shadow">{selectedEffectToPlace.effectIcon}</span>
+                        </div>
+                      );
+                    })() : hoverCell ? (
                       <div
                         style={{
                           left: `${(hoverCell.x / activeMap.gridCols) * 100}%`,
@@ -1410,10 +1875,10 @@ export default function SiteBattleMapModal({
                         }}
                         className="absolute z-10 bg-amber-500/15 pointer-events-none"
                       />
-                    )}
+                    ) : null}
 
                     {/* Selected Token Cell Highlight */}
-                    {selectedToken && (
+                    {selectedToken && selectedToken.type !== "effect" && (
                       <div
                         style={{
                           left: `${(selectedToken.x / activeMap.gridCols) * 100}%`,
@@ -1441,61 +1906,147 @@ export default function SiteBattleMapModal({
                       ) : null
                     )}
 
-                    {/* Deployed Tokens Layer */}
-                    {activeMap.tokens.map((tokenHere) => {
-                      const cellVisibleToPlayers = isCellVisibleToPlayers(tokenHere.x, tokenHere.y);
-                      const shouldShowToken = effectiveDmMode || tokenHere.type === "player" || cellVisibleToPlayers;
-                      if (!shouldShowToken) return null;
+                    {/* Environment Effects & Spell AoE Underlay Layer (z-[15] underneath unit tokens) */}
+                    {activeMap.tokens
+                      .filter((t) => t.type === "effect")
+                      .map((effectHere) => {
+                        const cellVisibleToPlayers = isCellVisibleToPlayers(effectHere.x, effectHere.y);
+                        const shouldShowEffect =
+                          effectiveDmMode || (!effectHere.isEffectHidden && cellVisibleToPlayers);
+                        if (!shouldShowEffect) return null;
 
-                      return (
-                        <div
-                          key={tokenHere.id}
-                          style={{
-                            left: `${((tokenHere.x + 0.5) / activeMap.gridCols) * 100}%`,
-                            top: `${((tokenHere.y + 0.5) / activeMap.gridRows) * 100}%`,
-                            transform: "translate(-50%, -50%)"
-                          }}
-                          className="absolute z-20 flex flex-col items-center pointer-events-none"
-                          title={`${tokenHere.name} (${tokenHere.x + 1}, ${tokenHere.y + 1})`}
-                        >
+                        const rad = effectHere.areaRadius || 0;
+                        const spanCells = rad * 2 + 1;
+                        const tint = effectHere.color || "#22c55e";
+                        const isSelected = selectedTokenId === effectHere.id;
+                        const hasUnitAtCenter = activeMap.tokens.some(
+                          (u) => u.type !== "effect" && u.x === effectHere.x && u.y === effectHere.y
+                        );
+
+                        return (
                           <div
-                            style={{ width: `${tokenPx}px`, height: `${tokenPx}px` }}
-                            className={`rounded-full border-2 overflow-hidden flex items-center justify-center font-bold text-[10px] shadow-xl transition-transform ${
-                              tokenHere.type === "player"
-                                ? "border-amber-400 bg-amber-950 text-amber-200 ring-2 ring-amber-500/40"
-                                : "border-red-400 bg-red-950 text-red-200 ring-2 ring-red-500/40"
-                            } ${selectedTokenId === tokenHere.id ? "scale-115 ring-4 ring-amber-300 animate-pulse" : ""}`}
+                            key={effectHere.id}
+                            style={{
+                              left: `${((effectHere.x + 0.5) / activeMap.gridCols) * 100}%`,
+                              top: `${((effectHere.y + 0.5) / activeMap.gridRows) * 100}%`,
+                              width: `${(spanCells / activeMap.gridCols) * 100}%`,
+                              height: `${(spanCells / activeMap.gridRows) * 100}%`,
+                              transform: "translate(-50%, -50%)",
+                              backgroundColor: `${tint}30`,
+                              borderColor: isSelected ? "#fbbf24" : tint,
+                              boxShadow: isSelected ? `0 0 18px ${tint}88` : `inset 0 0 14px ${tint}38`
+                            }}
+                            className={`absolute z-[15] rounded-xl border-2 ${
+                              isSelected ? "ring-2 ring-amber-400 border-solid" : "border-dashed"
+                            } flex flex-col items-center justify-between p-1 pointer-events-none transition-all ${
+                              effectHere.isEffectHidden ? "opacity-65" : ""
+                            }`}
+                            title={`${effectHere.name} (${spanCells * 5}ft × ${spanCells * 5}ft)${effectHere.notes ? ` — ${effectHere.notes}` : ""}`}
                           >
-                            {tokenHere.avatarUrl ? (
-                              <img src={tokenHere.avatarUrl} alt={tokenHere.name} className="w-full h-full object-cover" />
-                            ) : (
-                              tokenHere.name[0]
+                            {/* Top Corner Tags: DM Hidden Trap & Round Duration */}
+                            <div className="w-full flex items-center justify-between gap-1 text-[8px] font-mono leading-none">
+                              {effectHere.isEffectHidden ? (
+                                <span className="px-1 py-0.5 rounded bg-black/80 text-amber-300 border border-amber-500/40">
+                                  DM Trap
+                                </span>
+                              ) : (
+                                <span />
+                              )}
+                              {effectHere.effectDuration !== undefined && (
+                                <span
+                                  className={`px-1 py-0.5 rounded font-bold ${
+                                    effectHere.effectDuration === 0
+                                      ? "bg-red-950/90 text-red-300 border border-red-500/40"
+                                      : "bg-black/80 text-slate-200 border border-white/15"
+                                  }`}
+                                >
+                                  ⏳ {effectHere.effectDuration}r
+                                </span>
+                              )}
+                            </div>
+
+                            {/* Center Emblem (faded slightly if a character stands on exact center tile) */}
+                            <div
+                              style={{ borderColor: `${tint}99` }}
+                              className={`flex items-center justify-center rounded-full bg-black/55 border shadow ${
+                                hasUnitAtCenter ? "opacity-35 scale-75" : "opacity-95"
+                              } ${spanCells >= 3 ? "w-8 h-8 text-base" : "w-6 h-6 text-xs"}`}
+                            >
+                              <span>{effectHere.effectIcon || "✨"}</span>
+                            </div>
+
+                            {/* Bottom Zone Title */}
+                            {cellPx >= 20 && (
+                              <span
+                                style={{ borderColor: `${tint}66` }}
+                                className="text-[8px] font-mono font-bold px-1.5 py-0.5 rounded bg-black/80 text-slate-100 border whitespace-nowrap max-w-full truncate shadow"
+                              >
+                                {effectHere.name}
+                              </span>
                             )}
                           </div>
+                        );
+                      })}
 
-                          {tokenHere.hp && cellPx >= 28 && (
-                            <div className="w-7 h-1 bg-black/60 rounded-full overflow-hidden mt-0.5 border border-white/20">
-                              <div
-                                style={{ width: `${Math.min(100, Math.floor((tokenHere.hp.current / tokenHere.hp.max) * 100))}%` }}
-                                className={`h-full ${
-                                  tokenHere.hp.current / tokenHere.hp.max > 0.5
-                                    ? "bg-emerald-400"
-                                    : tokenHere.hp.current / tokenHere.hp.max > 0.2
-                                    ? "bg-amber-400"
-                                    : "bg-red-500"
-                                }`}
-                              />
+                    {/* Deployed Unit Tokens Layer (Players, Enemies, NPCs on z-20 above effects) */}
+                    {activeMap.tokens
+                      .filter((t) => t.type !== "effect")
+                      .map((tokenHere) => {
+                        const cellVisibleToPlayers = isCellVisibleToPlayers(tokenHere.x, tokenHere.y);
+                        const shouldShowToken = effectiveDmMode || tokenHere.type === "player" || cellVisibleToPlayers;
+                        if (!shouldShowToken) return null;
+
+                        return (
+                          <div
+                            key={tokenHere.id}
+                            style={{
+                              left: `${((tokenHere.x + 0.5) / activeMap.gridCols) * 100}%`,
+                              top: `${((tokenHere.y + 0.5) / activeMap.gridRows) * 100}%`,
+                              transform: "translate(-50%, -50%)"
+                            }}
+                            className="absolute z-20 flex flex-col items-center pointer-events-none"
+                            title={`${tokenHere.name} (${tokenHere.x + 1}, ${tokenHere.y + 1})`}
+                          >
+                            <div
+                              style={{ width: `${tokenPx}px`, height: `${tokenPx}px` }}
+                              className={`rounded-full border-2 overflow-hidden flex items-center justify-center font-bold text-[10px] shadow-xl transition-transform ${
+                                tokenHere.type === "player"
+                                  ? "border-amber-400 bg-amber-950 text-amber-200 ring-2 ring-amber-500/40"
+                                  : tokenHere.type === "npc"
+                                  ? "border-cyan-400 bg-cyan-950 text-cyan-200 ring-2 ring-cyan-500/40"
+                                  : "border-red-400 bg-red-950 text-red-200 ring-2 ring-red-500/40"
+                              } ${selectedTokenId === tokenHere.id ? "scale-115 ring-4 ring-amber-300 animate-pulse" : ""}`}
+                            >
+                              {tokenHere.avatarUrl ? (
+                                <img src={tokenHere.avatarUrl} alt={tokenHere.name} className="w-full h-full object-cover" />
+                              ) : (
+                                tokenHere.name[0]
+                              )}
                             </div>
-                          )}
 
-                          {cellPx >= 24 && (
-                            <span className="text-[8px] font-mono font-bold px-1 rounded bg-black/85 text-slate-100 whitespace-nowrap mt-0.5 max-w-[54px] truncate shadow">
-                              {tokenHere.name.split(" ")[0]}
-                            </span>
-                          )}
-                        </div>
-                      );
-                    })}
+                            {tokenHere.hp && cellPx >= 28 && canViewTokenHp(tokenHere) && (
+                              <div className="w-7 h-1 bg-black/60 rounded-full overflow-hidden mt-0.5 border border-white/20">
+                                <div
+                                  style={{ width: `${Math.min(100, Math.floor((tokenHere.hp.current / tokenHere.hp.max) * 100))}%` }}
+                                  className={`h-full ${
+                                    tokenHere.hp.current / tokenHere.hp.max > 0.5
+                                      ? "bg-emerald-400"
+                                      : tokenHere.hp.current / tokenHere.hp.max > 0.2
+                                      ? "bg-amber-400"
+                                      : "bg-red-500"
+                                  }`}
+                                />
+                              </div>
+                            )}
+
+                            {cellPx >= 24 && (
+                              <span className="text-[8px] font-mono font-bold px-1 rounded bg-black/85 text-slate-100 whitespace-nowrap mt-0.5 max-w-[54px] truncate shadow">
+                                {tokenHere.name.split(" ")[0]}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
 
                     {/* Ruler SVG vector line (Resolution-independent for 4x4 to 100x100) */}
                     {rulerStart && rulerEnd && (
@@ -1619,6 +2170,57 @@ export default function SiteBattleMapModal({
               ))}
             </div>
 
+            {/* Environment Effects & D&D Spell AoE Tokens */}
+            <div className="w-full flex items-center gap-1.5 pt-1.5 border-t border-white/5 overflow-x-auto">
+              <button
+                type="button"
+                onClick={() => setIsEffectModalOpen(true)}
+                className="px-2.5 py-1 bg-purple-600/25 hover:bg-purple-600/45 text-purple-200 border border-purple-500/40 rounded-lg text-3xs font-mono font-bold transition-all cursor-pointer flex items-center space-x-1 shrink-0"
+                title="Create custom D&D environment hazard or spell Area of Effect token"
+              >
+                <Flame className="w-3 h-3 text-amber-400" />
+                <span>+ Env Effect</span>
+              </button>
+
+              <span className="text-3xs font-mono uppercase text-purple-400 font-bold shrink-0">
+                Hazards / AoE:
+              </span>
+
+              {ENVIRONMENT_EFFECT_PRESETS.slice(0, 8).map((preset) => {
+                const isArmed =
+                  activeTool === "place-effect" &&
+                  selectedEffectToPlace?.effectType === preset.effectType &&
+                  selectedEffectToPlace?.name === preset.name;
+                return (
+                  <button
+                    key={preset.name}
+                    type="button"
+                    onClick={() => {
+                      if (isArmed) {
+                        setSelectedEffectToPlace(null);
+                        setActiveTool("select");
+                      } else {
+                        setSelectedHeroToPlace(null);
+                        setSelectedTokenId(null);
+                        setSelectedEffectToPlace(preset);
+                        setActiveTool("place-effect");
+                      }
+                    }}
+                    style={isArmed ? { borderColor: preset.color, backgroundColor: `${preset.color}33` } : undefined}
+                    className={`px-2 py-0.5 rounded border text-3xs font-mono flex items-center space-x-1 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                      isArmed
+                        ? "text-white font-bold shadow"
+                        : "bg-[#141622] hover:bg-white/10 text-slate-300 border-white/10"
+                    }`}
+                    title={`Click then tap a grid square to place ${preset.name} (${((preset.areaRadius || 0) * 2 + 1) * 5}ft)`}
+                  >
+                    <span>{preset.effectIcon}</span>
+                    <span>{preset.name}</span>
+                  </button>
+                );
+              })}
+            </div>
+
           </div>
 
         </div>
@@ -1660,8 +2262,159 @@ export default function SiteBattleMapModal({
               </p>
             </div>
 
-            {/* Token Inspector (when a token is selected) */}
-            {selectedToken ? (
+            {/* Token / Effect Inspector */}
+            {selectedToken && selectedToken.type === "effect" ? (
+              <div
+                style={{ borderColor: selectedToken.color || "#a855f7" }}
+                className="p-3 bg-[#141622] border rounded-xl space-y-3 animate-in fade-in"
+              >
+                <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                  <div className="flex items-center space-x-2 min-w-0">
+                    <div
+                      style={{
+                        borderColor: selectedToken.color || "#a855f7",
+                        backgroundColor: `${selectedToken.color || "#a855f7"}26`
+                      }}
+                      className="w-8 h-8 rounded-lg border flex items-center justify-center text-base shrink-0"
+                    >
+                      {selectedToken.effectIcon || "✨"}
+                    </div>
+                    <div className="min-w-0">
+                      <h4 className="text-xs font-bold text-white font-serif truncate">{selectedToken.name}</h4>
+                      <span className="text-3xs font-mono text-purple-300 uppercase">
+                        Env Effect • {((selectedToken.areaRadius || 0) * 2 + 1) * 5}ft ({(selectedToken.areaRadius || 0) * 2 + 1}×{(selectedToken.areaRadius || 0) * 2 + 1}) • ({selectedToken.x + 1}, {selectedToken.y + 1})
+                      </span>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteToken(selectedToken.id)}
+                    className="p-1 text-slate-500 hover:text-red-400 rounded transition-colors cursor-pointer"
+                    title="Remove environment effect from grid"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                {/* Area of Effect Size Controls */}
+                <div className="space-y-1">
+                  <span className="text-3xs font-mono uppercase text-slate-400 font-bold block">
+                    Area Radius / Footprint
+                  </span>
+                  <div className="grid grid-cols-4 gap-1">
+                    {[
+                      { r: 0, label: "5ft" },
+                      { r: 1, label: "15ft" },
+                      { r: 2, label: "25ft" },
+                      { r: 3, label: "35ft" }
+                    ].map((sz) => (
+                      <button
+                        key={sz.r}
+                        type="button"
+                        onClick={() => handleUpdateEffectProps(selectedToken.id, { areaRadius: sz.r })}
+                        className={`py-1 rounded border text-[10px] font-mono font-bold cursor-pointer transition-all ${
+                          (selectedToken.areaRadius || 0) === sz.r
+                            ? "bg-amber-500 text-black border-amber-300"
+                            : "bg-black/40 text-slate-300 border-white/10 hover:border-white/30"
+                        }`}
+                      >
+                        {sz.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Duration Counter (Rounds) & DM Visibility Toggle */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-2xs font-mono text-slate-300">
+                    <span className="flex items-center gap-1">
+                      <Hourglass className="w-3 h-3 text-amber-400" />
+                      <span>Duration</span>
+                    </span>
+                    <span className="font-bold text-amber-300">
+                      {selectedToken.effectDuration === undefined
+                        ? "Permanent / ∞"
+                        : selectedToken.effectDuration === 0
+                        ? "Expired (0r)"
+                        : `${selectedToken.effectDuration} round${selectedToken.effectDuration === 1 ? "" : "s"}`}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1 text-[10px] font-mono">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleUpdateEffectProps(selectedToken.id, {
+                          effectDuration: Math.max(0, (selectedToken.effectDuration ?? 1) - 1)
+                        })
+                      }
+                      className="px-2 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded text-slate-200 cursor-pointer"
+                    >
+                      -1r
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleUpdateEffectProps(selectedToken.id, {
+                          effectDuration: (selectedToken.effectDuration ?? 0) + 1
+                        })
+                      }
+                      className="px-2 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded text-slate-200 cursor-pointer"
+                    >
+                      +1r
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleUpdateEffectProps(selectedToken.id, {
+                          effectDuration: selectedToken.effectDuration === undefined ? 10 : undefined
+                        })
+                      }
+                      className="flex-1 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded text-slate-300 cursor-pointer"
+                    >
+                      {selectedToken.effectDuration === undefined ? "Set 10r" : "Make ∞"}
+                    </button>
+                    {effectiveDmMode && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleUpdateEffectProps(selectedToken.id, {
+                            isEffectHidden: !selectedToken.isEffectHidden
+                          })
+                        }
+                        className={`px-2 py-1 rounded border flex items-center gap-1 cursor-pointer ${
+                          selectedToken.isEffectHidden
+                            ? "bg-amber-500/20 border-amber-500/50 text-amber-300 font-bold"
+                            : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
+                        }`}
+                        title={selectedToken.isEffectHidden ? "Hidden trap/effect — click to reveal to players" : "Visible to players — click to hide (DM Trap)"}
+                      >
+                        {selectedToken.isEffectHidden ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                        <span>{selectedToken.isEffectHidden ? "Hidden" : "Shown"}</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Rule / Save DC Notes */}
+                <div className="space-y-1">
+                  <span className="text-3xs font-mono uppercase text-slate-400 font-bold block">
+                    Effect Rules / Save DC
+                  </span>
+                  <textarea
+                    rows={2}
+                    value={selectedToken.notes || ""}
+                    onChange={(e) => handleUpdateEffectProps(selectedToken.id, { notes: e.target.value })}
+                    placeholder="e.g. DC 14 CON save or 2d8 poison dmg..."
+                    className="w-full bg-[#0d0f17] border border-white/10 rounded-lg px-2 py-1.5 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-purple-400 resize-none"
+                  />
+                </div>
+
+                <p className="text-3xs font-mono text-slate-400 italic">
+                  💡 Click any square on the grid to center-move this effect zone.
+                </p>
+              </div>
+            ) : selectedToken ? (
               <div className="p-3 bg-[#141622] border border-amber-500/40 rounded-xl space-y-3 animate-in fade-in">
                 <div className="flex items-center justify-between border-b border-white/10 pb-2">
                   <div className="flex items-center space-x-2">
@@ -1675,7 +2428,7 @@ export default function SiteBattleMapModal({
                     <div>
                       <h4 className="text-xs font-bold text-white font-serif">{selectedToken.name}</h4>
                       <span className="text-3xs font-mono text-amber-400 uppercase">
-                        {selectedToken.type === "player" ? "Heroic Adventurer" : "Adversary"} • Pos ({selectedToken.x + 1}, {selectedToken.y + 1})
+                        {selectedToken.type === "player" ? "Heroic Adventurer" : selectedToken.type === "npc" ? "NPC" : "Adversary"} • Pos ({selectedToken.x + 1}, {selectedToken.y + 1})
                       </span>
                     </div>
                   </div>
@@ -1689,47 +2442,137 @@ export default function SiteBattleMapModal({
                   </button>
                 </div>
 
-                {/* HP adjustments */}
-                {selectedToken.hp && (
-                  <div className="space-y-1.5">
-                    <div className="flex justify-between text-2xs font-mono text-slate-300">
-                      <span>Vitality Pool</span>
-                      <span className="text-amber-400 font-bold">{selectedToken.hp.current} / {selectedToken.hp.max} HP</span>
-                    </div>
-                    <div className="flex items-center space-x-1.5">
-                      <button
-                        onClick={() => handleTokenHpDelta(selectedToken.id, -5)}
-                        className="px-2 py-0.5 bg-red-950/60 hover:bg-red-900 text-red-300 rounded font-mono text-3xs border border-red-500/30"
-                      >
-                        -5
-                      </button>
-                      <button
-                        onClick={() => handleTokenHpDelta(selectedToken.id, -1)}
-                        className="px-2 py-0.5 bg-red-950/60 hover:bg-red-900 text-red-300 rounded font-mono text-3xs border border-red-500/30"
-                      >
-                        -1
-                      </button>
-                      <div className="flex-1 h-2 bg-black/60 rounded-full overflow-hidden border border-white/10">
-                        <div
-                          style={{ width: `${Math.min(100, Math.floor((selectedToken.hp.current / selectedToken.hp.max) * 100))}%` }}
-                          className="h-full bg-amber-500 transition-all"
-                        />
+                {/* HP adjustments & Individual DM Hide/Show Toggle */}
+                {selectedToken.hp && (() => {
+                  const tokenHidden = isTokenHpHidden(selectedToken);
+                  const canView = effectiveDmMode || !tokenHidden;
+                  return (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between text-2xs font-mono text-slate-300 gap-2">
+                        <span className="flex items-center gap-1.5">
+                          <span>Vitality Pool</span>
+                          {effectiveDmMode && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleToggleTokenHpHidden(selectedToken.id);
+                              }}
+                              className={`px-1.5 py-0.5 rounded border text-[9px] uppercase inline-flex items-center gap-1 cursor-pointer transition-all ${
+                                tokenHidden
+                                  ? "bg-amber-500/20 border-amber-500/50 text-amber-300 font-bold"
+                                  : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
+                              }`}
+                              title={tokenHidden ? "HP hidden from players — click to reveal" : "HP visible to players — click to hide"}
+                            >
+                              {tokenHidden ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                              <span>{tokenHidden ? "Hidden" : "Shown"}</span>
+                            </button>
+                          )}
+                        </span>
+                        {canView ? (
+                          <span className="text-amber-400 font-bold">{selectedToken.hp.current} / {selectedToken.hp.max} HP</span>
+                        ) : (
+                          <span className="text-amber-400/90 font-bold flex items-center gap-1">
+                            <EyeOff className="w-3 h-3" />
+                            Hidden by DM
+                          </span>
+                        )}
                       </div>
-                      <button
-                        onClick={() => handleTokenHpDelta(selectedToken.id, 1)}
-                        className="px-2 py-0.5 bg-emerald-950/60 hover:bg-emerald-900 text-emerald-300 rounded font-mono text-3xs border border-emerald-500/30"
-                      >
-                        +1
-                      </button>
-                      <button
-                        onClick={() => handleTokenHpDelta(selectedToken.id, 5)}
-                        className="px-2 py-0.5 bg-emerald-950/60 hover:bg-emerald-900 text-emerald-300 rounded font-mono text-3xs border border-emerald-500/30"
-                      >
-                        +5
-                      </button>
+
+                      {canView ? (
+                        <>
+                          <div className="flex items-center space-x-1.5">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleTokenHpDelta(selectedToken.id, -5);
+                              }}
+                              className="px-2 py-0.5 bg-red-950/60 hover:bg-red-900 text-red-300 rounded font-mono text-3xs border border-red-500/30 cursor-pointer"
+                            >
+                              -5
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleTokenHpDelta(selectedToken.id, -1);
+                              }}
+                              className="px-2 py-0.5 bg-red-950/60 hover:bg-red-900 text-red-300 rounded font-mono text-3xs border border-red-500/30 cursor-pointer"
+                            >
+                              -1
+                            </button>
+                            <div className="flex-1 h-2 bg-black/60 rounded-full overflow-hidden border border-white/10">
+                              <div
+                                style={{ width: `${Math.min(100, Math.floor((selectedToken.hp.current / selectedToken.hp.max) * 100))}%` }}
+                                className={`h-full transition-all ${
+                                  selectedToken.hp.current / selectedToken.hp.max > 0.5
+                                    ? "bg-emerald-400"
+                                    : selectedToken.hp.current / selectedToken.hp.max > 0.2
+                                    ? "bg-amber-400"
+                                    : "bg-red-500"
+                                }`}
+                              />
+                            </div>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleTokenHpDelta(selectedToken.id, 1);
+                              }}
+                              className="px-2 py-0.5 bg-emerald-950/60 hover:bg-emerald-900 text-emerald-300 rounded font-mono text-3xs border border-emerald-500/30 cursor-pointer"
+                            >
+                              +1
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleTokenHpDelta(selectedToken.id, 5);
+                              }}
+                              className="px-2 py-0.5 bg-emerald-950/60 hover:bg-emerald-900 text-emerald-300 rounded font-mono text-3xs border border-emerald-500/30 cursor-pointer"
+                            >
+                              +5
+                            </button>
+                          </div>
+
+                          {/* Exact Custom Damage / Heal Input */}
+                          <div
+                            onClick={(e) => e.stopPropagation()}
+                            className="flex items-center gap-1.5 pt-1 text-[10px] font-mono"
+                          >
+                            <input
+                              type="number"
+                              min={1}
+                              max={999}
+                              value={customHpAmount}
+                              onChange={(e) => setCustomHpAmount(Math.max(1, parseInt(e.target.value) || 1))}
+                              className="w-14 bg-[#0d0f17] border border-white/10 text-amber-300 font-bold text-center py-1 rounded focus:outline-none focus:border-amber-500"
+                              title="Exact damage or heal amount"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleTokenHpDelta(selectedToken.id, -Math.abs(customHpAmount))}
+                              className="flex-1 py-1 bg-red-950/70 hover:bg-red-900 text-red-200 border border-red-500/40 rounded font-bold uppercase cursor-pointer"
+                            >
+                              ⚔️ Damage
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleTokenHpDelta(selectedToken.id, Math.abs(customHpAmount))}
+                              className="flex-1 py-1 bg-emerald-950/70 hover:bg-emerald-900 text-emerald-200 border border-emerald-500/40 rounded font-bold uppercase cursor-pointer"
+                            >
+                              💚 Heal
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="h-2 bg-slate-800/80 rounded-full border border-white/5" />
+                      )}
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
 
                 <p className="text-3xs font-mono text-slate-400 italic">
                   💡 Tap any empty square on the battle grid to move this token instantly.
@@ -1742,45 +2585,259 @@ export default function SiteBattleMapModal({
                   No Token Selected
                 </span>
                 <p className="text-3xs font-mono text-slate-500">
-                  Click a token on the grid to inspect vitality or move them across squares.
+                  Click a unit or environment effect on the grid to inspect or reposition it.
                 </p>
               </div>
             )}
 
-            {/* Tokens Roster Summary List */}
-            <div className="space-y-1.5">
-              <span className="text-3xs font-mono uppercase text-slate-500 font-bold block">
-                Deployed Combatants ({activeMap.tokens.filter(t => effectiveDmMode || t.type === "player" || isCellVisibleToPlayers(t.x, t.y)).length}):
-              </span>
-              <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
-                {activeMap.tokens.filter(t => effectiveDmMode || t.type === "player" || isCellVisibleToPlayers(t.x, t.y)).length === 0 ? (
-                  <p className="text-3xs text-slate-600 font-mono italic">
-                    Grid clear. Deploy characters or spawn adversaries below.
-                  </p>
-                ) : (
-                  activeMap.tokens
-                    .filter(t => effectiveDmMode || t.type === "player" || isCellVisibleToPlayers(t.x, t.y))
-                    .map(token => (
-                    <div
-                      key={token.id}
-                      onClick={() => setSelectedTokenId(token.id)}
-                      className={`p-2 rounded-lg border text-2xs font-mono flex items-center justify-between cursor-pointer transition-all ${
-                        selectedTokenId === token.id
-                          ? "bg-amber-500/15 border-amber-500 text-amber-300 font-bold"
-                          : "bg-[#13151f] border-white/5 text-slate-300 hover:border-white/20"
-                      }`}
-                    >
-                      <div className="flex items-center space-x-2 min-w-0">
-                        <span className={`w-2 h-2 rounded-full ${token.type === "player" ? "bg-amber-400" : "bg-red-400"}`} />
-                        <span className="truncate">{token.name}</span>
-                      </div>
-                      <span className="text-3xs text-slate-500 font-mono">
-                        ({token.x + 1},{token.y + 1})
+            {/* Combatants Roster Summary List with Individual DM HP Hide/Show Controls */}
+            {(() => {
+              const visibleCombatants = activeMap.tokens.filter(
+                (t) => t.type !== "effect" && (effectiveDmMode || t.type === "player" || isCellVisibleToPlayers(t.x, t.y))
+              );
+              const visibleEffects = activeMap.tokens.filter(
+                (t) => t.type === "effect" && (effectiveDmMode || (!t.isEffectHidden && isCellVisibleToPlayers(t.x, t.y)))
+              );
+              const hasTimedEffects = visibleEffects.some((e) => e.effectDuration !== undefined && e.effectDuration > 0);
+
+              return (
+                <>
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="text-3xs font-mono uppercase text-slate-500 font-bold">
+                        Combatants ({visibleCombatants.length}):
                       </span>
+                      {effectiveDmMode && visibleCombatants.length > 0 && (
+                        <div className="flex items-center gap-1 text-[9px] font-mono">
+                          <button
+                            type="button"
+                            onClick={() => handleBulkSetTokenHpVisibility("hide-non-players")}
+                            className="px-1.5 py-0.5 rounded bg-white/5 hover:bg-amber-500/20 text-slate-400 hover:text-amber-300 border border-white/10 cursor-pointer"
+                            title="Hide HP on all Enemy & NPC tokens"
+                          >
+                            Hide Foes HP
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleBulkSetTokenHpVisibility("show-all")}
+                            className="px-1.5 py-0.5 rounded bg-white/5 hover:bg-emerald-500/20 text-slate-400 hover:text-emerald-300 border border-white/10 cursor-pointer"
+                            title="Reveal HP for all tokens on this grid"
+                          >
+                            Show All
+                          </button>
+                        </div>
+                      )}
                     </div>
-                  ))
+                    <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
+                      {visibleCombatants.length === 0 ? (
+                        <p className="text-3xs text-slate-600 font-mono italic">
+                          Grid clear. Deploy characters or spawn adversaries below.
+                        </p>
+                      ) : (
+                        visibleCombatants.map((token) => {
+                          const tokenHidden = isTokenHpHidden(token);
+                          const canView = effectiveDmMode || !tokenHidden;
+                          return (
+                            <div
+                              key={token.id}
+                              onClick={() => setSelectedTokenId(token.id)}
+                              className={`p-2 rounded-lg border text-2xs font-mono flex items-center justify-between gap-2 cursor-pointer transition-all ${
+                                selectedTokenId === token.id
+                                  ? "bg-amber-500/15 border-amber-500 text-amber-300 font-bold"
+                                  : "bg-[#13151f] border-white/5 text-slate-300 hover:border-white/20"
+                              }`}
+                            >
+                              <div className="flex items-center space-x-2 min-w-0 flex-1">
+                                <span
+                                  className={`w-2 h-2 rounded-full shrink-0 ${
+                                    token.type === "player" ? "bg-amber-400" : token.type === "npc" ? "bg-cyan-400" : "bg-red-400"
+                                  }`}
+                                />
+                                <span className="truncate">{token.name}</span>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                {token.hp &&
+                                  (canView ? (
+                                    <span className="text-[10px] text-emerald-300 font-bold">
+                                      {token.hp.current}/{token.hp.max}
+                                    </span>
+                                  ) : (
+                                    <span className="text-[9px] text-amber-400/90 flex items-center gap-0.5">
+                                      <EyeOff className="w-2.5 h-2.5" />
+                                      Hidden
+                                    </span>
+                                  ))}
+                                {effectiveDmMode && token.hp && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleToggleTokenHpHidden(token.id);
+                                    }}
+                                    className={`p-1 rounded border cursor-pointer transition-all ${
+                                      tokenHidden
+                                        ? "bg-amber-500/20 border-amber-500/50 text-amber-300"
+                                        : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
+                                    }`}
+                                    title={tokenHidden ? "HP hidden from players — click to show" : "HP visible to players — click to hide"}
+                                  >
+                                    {tokenHidden ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Active Environment Effects & Hazards List */}
+                  <div className="space-y-1.5 pt-2 border-t border-white/10">
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="text-3xs font-mono uppercase text-purple-300 font-bold flex items-center gap-1">
+                        <Flame className="w-3 h-3 text-amber-400" />
+                        <span>Env Effects ({visibleEffects.length})</span>
+                      </span>
+                      {effectiveDmMode && hasTimedEffects && (
+                        <button
+                          type="button"
+                          onClick={handleTickAllEffectDurations}
+                          className="px-1.5 py-0.5 rounded bg-purple-950/60 hover:bg-purple-900/70 text-purple-200 border border-purple-500/30 text-[9px] font-mono cursor-pointer"
+                          title="Decrement duration of all active environment effects by 1 round"
+                        >
+                          ⏳ Tick -1r All
+                        </button>
+                      )}
+                    </div>
+
+                    {visibleEffects.length === 0 ? (
+                      <p className="text-[10px] font-mono text-slate-600 italic">
+                        No active hazards. Pick a D&D effect pill below to cast on the grid.
+                      </p>
+                    ) : (
+                      <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
+                        {visibleEffects.map((eff) => (
+                          <div
+                            key={eff.id}
+                            onClick={() => setSelectedTokenId(eff.id)}
+                            className={`p-1.5 rounded-lg border text-2xs font-mono flex items-center justify-between gap-1.5 cursor-pointer transition-all ${
+                              selectedTokenId === eff.id
+                                ? "bg-purple-500/20 border-purple-400 text-white font-bold"
+                                : "bg-[#13151f] border-white/5 text-slate-300 hover:border-white/20"
+                            }`}
+                          >
+                            <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                              <span className="text-xs shrink-0">{eff.effectIcon || "✨"}</span>
+                              <span className="truncate">{eff.name}</span>
+                              <span className="text-[9px] text-slate-400 shrink-0">
+                                {((eff.areaRadius || 0) * 2 + 1) * 5}ft
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              {eff.effectDuration !== undefined && (
+                                <span
+                                  className={`text-[9px] px-1 rounded ${
+                                    eff.effectDuration === 0
+                                      ? "bg-red-950 text-red-300"
+                                      : "bg-black/50 text-amber-300"
+                                  }`}
+                                >
+                                  {eff.effectDuration}r
+                                </span>
+                              )}
+                              {effectiveDmMode && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleUpdateEffectProps(eff.id, { isEffectHidden: !eff.isEffectHidden });
+                                  }}
+                                  className={`p-0.5 rounded border cursor-pointer ${
+                                    eff.isEffectHidden
+                                      ? "bg-amber-500/20 border-amber-500/50 text-amber-300"
+                                      : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
+                                  }`}
+                                  title={eff.isEffectHidden ? "Hidden from players — click to reveal" : "Visible to players — click to hide"}
+                                >
+                                  {eff.isEffectHidden ? <EyeOff className="w-2.5 h-2.5" /> : <Eye className="w-2.5 h-2.5" />}
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteToken(eff.id);
+                                }}
+                                className="p-0.5 text-slate-500 hover:text-red-400 cursor-pointer"
+                                title="Remove effect"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              );
+            })()}
+
+            {/* Compact Combat Damage & Heal Log */}
+            <div className="space-y-1.5 pt-2 border-t border-white/10">
+              <div className="flex items-center justify-between">
+                <span className="text-3xs font-mono uppercase text-slate-400 font-bold flex items-center gap-1">
+                  <Heart className="w-3 h-3 text-red-400" />
+                  Damage & Heal Log ({hpLogs.length})
+                </span>
+                {effectiveDmMode && onClearHpLogs && hpLogs.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={onClearHpLogs}
+                    className="text-[9px] font-mono text-slate-500 hover:text-red-400 cursor-pointer"
+                  >
+                    Clear
+                  </button>
                 )}
               </div>
+              {hpLogs.length === 0 ? (
+                <p className="text-[10px] font-mono text-slate-600 italic">
+                  Damage & heals will be recorded here automatically.
+                </p>
+              ) : (
+                <div className="space-y-1 max-h-32 overflow-y-auto pr-1">
+                  {hpLogs.slice(0, 12).map((entry) => {
+                    const isHeal = entry.delta > 0;
+                    const linkedChar = entry.characterId ? characters.find((c) => c.id === entry.characterId) : undefined;
+                    const tokMatch = activeMap.tokens.find((t) => t.id === entry.targetId || (entry.characterId && t.characterId === entry.characterId));
+                    const isTargetHidden = !effectiveDmMode && (
+                      tokMatch ? isTokenHpHidden(tokMatch) : linkedChar ? !!linkedChar.isHpHidden : entry.targetType !== "player"
+                    );
+                    return (
+                      <div
+                        key={entry.id}
+                        className={`px-2 py-1 rounded border text-[10px] font-mono flex items-center justify-between gap-1 ${
+                          isHeal
+                            ? "bg-emerald-950/20 border-emerald-500/20 text-emerald-200"
+                            : "bg-red-950/20 border-red-500/20 text-red-200"
+                        }`}
+                      >
+                        <span className="truncate font-semibold">{entry.targetName}</span>
+                        {isTargetHidden ? (
+                          <span className="text-[9px] text-amber-300/90 shrink-0">
+                            {isHeal ? "💚 Healed" : "⚔️ Hit"} (Hidden)
+                          </span>
+                        ) : (
+                          <span className="shrink-0 font-bold">
+                            {isHeal ? `+${entry.delta}` : entry.delta} ({entry.newHp}/{entry.maxHp})
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
           </div>
@@ -2302,6 +3359,19 @@ export default function SiteBattleMapModal({
                   </div>
                 </div>
 
+                {effectiveDmMode && (
+                  <label className="flex items-center gap-2 text-2xs font-mono text-amber-300 cursor-pointer select-none bg-[#141622] p-2.5 rounded-xl border border-amber-500/20">
+                    <input
+                      type="checkbox"
+                      checked={customMonsterIsHpHidden}
+                      onChange={(e) => setCustomMonsterIsHpHidden(e.target.checked)}
+                      className="rounded bg-[#161822] border-white/20 text-amber-500 focus:ring-0"
+                    />
+                    <EyeOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>Hide Health Points (HP) from Players (DM Only)</span>
+                  </label>
+                )}
+
                 <div className="flex space-x-2 pt-2 border-t border-white/10">
                   <button
                     type="submit"
@@ -2360,6 +3430,260 @@ export default function SiteBattleMapModal({
                 >
                   {interiorMaps.length <= 1 ? "Reset" : "Delete"}
                 </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL 6: D&D ENVIRONMENT EFFECT / SPELL AOE CREATOR */}
+      <AnimatePresence>
+        {isEffectModalOpen && (
+          <div className="fixed inset-0 z-70 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="w-full max-w-xl bg-[#0f1117] border border-purple-500/40 rounded-2xl p-5 shadow-2xl space-y-4 font-sans text-slate-200 max-h-[90vh] overflow-y-auto"
+            >
+              <div className="flex items-center justify-between border-b border-white/10 pb-3">
+                <div className="flex items-center space-x-2">
+                  <Flame className="w-5 h-5 text-amber-400" />
+                  <h3 className="text-sm font-bold font-serif italic text-white">
+                    Create D&amp;D Environment Effect / Spell AoE
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsEffectModalOpen(false)}
+                  className="text-slate-400 hover:text-white cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Curated D&D Hazard / Spell Presets */}
+              <div>
+                <label className="block text-3xs font-mono uppercase text-slate-400 mb-1.5">
+                  Choose a D&amp;D Hazard or Spell Preset:
+                </label>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                  {ENVIRONMENT_EFFECT_PRESETS.map((preset) => (
+                    <button
+                      key={preset.name}
+                      type="button"
+                      onClick={() => {
+                        setCustomEffectName(preset.name);
+                        setCustomEffectType(preset.effectType);
+                        setCustomEffectIcon(preset.effectIcon);
+                        setCustomEffectColor(preset.color);
+                        setCustomEffectRadius(preset.areaRadius);
+                        setCustomEffectDuration(preset.effectDuration !== undefined ? String(preset.effectDuration) : "");
+                        setCustomEffectNotes(preset.notes || "");
+                      }}
+                      className={`p-2 rounded-lg border text-left transition-all cursor-pointer flex items-center space-x-2 ${
+                        customEffectName === preset.name && customEffectType === preset.effectType
+                          ? "bg-purple-500/20 border-purple-400 text-white"
+                          : "bg-[#141622] hover:bg-white/5 border-white/10 text-slate-300"
+                      }`}
+                    >
+                      <span className="text-base shrink-0">{preset.effectIcon}</span>
+                      <div className="min-w-0">
+                        <p className="text-[11px] font-bold truncate">{preset.name}</p>
+                        <p className="text-[9px] font-mono text-slate-400">
+                          {((preset.areaRadius || 0) * 2 + 1) * 5}ft{preset.effectDuration ? ` • ${preset.effectDuration}r` : " • ∞"}
+                        </p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Effect Details Form */}
+              <div className="space-y-3 text-xs font-mono">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="sm:col-span-2">
+                    <label className="block text-3xs uppercase text-slate-400 mb-1">Effect Name</label>
+                    <input
+                      type="text"
+                      value={customEffectName}
+                      onChange={(e) => setCustomEffectName(e.target.value)}
+                      placeholder="e.g. Cloudkill, Wall of Fire..."
+                      className="w-full bg-[#141622] border border-white/10 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-purple-400"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-3xs uppercase text-slate-400 mb-1">Duration (Rounds)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={999}
+                      value={customEffectDuration}
+                      onChange={(e) => setCustomEffectDuration(e.target.value)}
+                      placeholder="∞ if empty"
+                      className="w-full bg-[#141622] border border-white/10 rounded-lg px-3 py-2 text-amber-300 focus:outline-none focus:border-purple-400"
+                    />
+                  </div>
+                </div>
+
+                {/* Icon Picker & Area Size */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-3xs uppercase text-slate-400 mb-1">Emblem Icon</label>
+                    <div className="flex flex-wrap gap-1">
+                      {["☠️", "🔥", "💤", "🕸️", "🌑", "🌫️", "❄️", "🧪", "⚡", "✨", "🔇", "🩸"].map((icon) => (
+                        <button
+                          key={icon}
+                          type="button"
+                          onClick={() => setCustomEffectIcon(icon)}
+                          className={`w-7 h-7 rounded-lg border flex items-center justify-center text-sm cursor-pointer transition-all ${
+                            customEffectIcon === icon
+                              ? "bg-amber-500/25 border-amber-400 scale-105"
+                              : "bg-[#141622] border-white/10 hover:border-white/30"
+                          }`}
+                        >
+                          {icon}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-3xs uppercase text-slate-400 mb-1">Area Footprint</label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {[
+                        { r: 0, label: "5ft (1×1)" },
+                        { r: 1, label: "15ft (3×3)" },
+                        { r: 2, label: "25ft (5×5)" },
+                        { r: 3, label: "35ft (7×7)" }
+                      ].map((sz) => (
+                        <button
+                          key={sz.r}
+                          type="button"
+                          onClick={() => setCustomEffectRadius(sz.r)}
+                          className={`py-1.5 rounded-lg border text-[11px] font-bold cursor-pointer transition-all ${
+                            customEffectRadius === sz.r
+                              ? "bg-amber-500 text-black border-amber-300"
+                              : "bg-[#141622] text-slate-300 border-white/10 hover:border-white/30"
+                          }`}
+                        >
+                          {sz.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Aura Tint */}
+                <div>
+                  <label className="block text-3xs uppercase text-slate-400 mb-1">Zone Tint Color</label>
+                  <div className="flex items-center space-x-2">
+                    {[
+                      "#22c55e",
+                      "#f97316",
+                      "#a855f7",
+                      "#cbd5e1",
+                      "#6366f1",
+                      "#38bdf8",
+                      "#84cc16",
+                      "#eab308",
+                      "#10b981",
+                      "#ec4899"
+                    ].map((c) => (
+                      <button
+                        key={c}
+                        type="button"
+                        onClick={() => setCustomEffectColor(c)}
+                        style={{ backgroundColor: c }}
+                        className={`w-6 h-6 rounded-full cursor-pointer transition-transform ${
+                          customEffectColor === c ? "ring-2 ring-white scale-110" : "opacity-75 hover:opacity-100"
+                        }`}
+                      />
+                    ))}
+                  </div>
+                </div>
+
+                {/* Rule / Save Note */}
+                <div>
+                  <label className="block text-3xs uppercase text-slate-400 mb-1">Rule / Save DC Notes</label>
+                  <textarea
+                    rows={2}
+                    value={customEffectNotes}
+                    onChange={(e) => setCustomEffectNotes(e.target.value)}
+                    placeholder="e.g. DC 15 CON save or take 3d8 poison damage..."
+                    className="w-full bg-[#141622] border border-white/10 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-purple-400 resize-none"
+                  />
+                </div>
+
+                {effectiveDmMode && (
+                  <label className="flex items-center gap-2 text-2xs font-mono text-amber-300 cursor-pointer select-none bg-[#141622] p-2.5 rounded-xl border border-amber-500/20">
+                    <input
+                      type="checkbox"
+                      checked={customEffectIsHidden}
+                      onChange={(e) => setCustomEffectIsHidden(e.target.checked)}
+                      className="rounded bg-[#161822] border-white/20 text-amber-500 focus:ring-0"
+                    />
+                    <EyeOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>Hide Hazard from Players until triggered (DM Trap Only)</span>
+                  </label>
+                )}
+
+                <div className="flex flex-wrap gap-2 pt-2 border-t border-white/10">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!customEffectName.trim()) return;
+                      const parsedDur = customEffectDuration.trim() ? Math.max(0, parseInt(customEffectDuration, 10) || 0) : undefined;
+                      setSelectedHeroToPlace(null);
+                      setSelectedTokenId(null);
+                      setSelectedEffectToPlace({
+                        name: customEffectName.trim(),
+                        effectType: customEffectType,
+                        effectIcon: customEffectIcon,
+                        color: customEffectColor,
+                        areaRadius: customEffectRadius,
+                        effectDuration: parsedDur,
+                        notes: customEffectNotes.trim() || undefined,
+                        isEffectHidden: effectiveDmMode ? customEffectIsHidden : false
+                      });
+                      setActiveTool("place-effect");
+                      setIsEffectModalOpen(false);
+                    }}
+                    className="flex-1 py-2 bg-purple-600 hover:bg-purple-500 text-white font-bold uppercase rounded-lg transition-colors cursor-pointer flex items-center justify-center space-x-1.5 shadow-lg"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    <span>Click Grid to Place</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!customEffectName.trim()) return;
+                      const parsedDur = customEffectDuration.trim() ? Math.max(0, parseInt(customEffectDuration, 10) || 0) : undefined;
+                      const draft: EnvironmentEffectDraft = {
+                        name: customEffectName.trim(),
+                        effectType: customEffectType,
+                        effectIcon: customEffectIcon,
+                        color: customEffectColor,
+                        areaRadius: customEffectRadius,
+                        effectDuration: parsedDur,
+                        notes: customEffectNotes.trim() || undefined,
+                        isEffectHidden: effectiveDmMode ? customEffectIsHidden : false
+                      };
+                      setIsEffectModalOpen(false);
+                      handleSpawnEffectAtCenter(draft);
+                    }}
+                    className="px-4 py-2 bg-amber-500/20 hover:bg-amber-500/35 text-amber-300 border border-amber-500/40 font-bold uppercase rounded-lg transition-colors cursor-pointer"
+                  >
+                    Spawn Center
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsEffectModalOpen(false)}
+                    className="px-4 py-2 bg-white/5 hover:bg-white/10 text-slate-400 rounded-lg transition-colors cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
               </div>
             </motion.div>
           </div>
