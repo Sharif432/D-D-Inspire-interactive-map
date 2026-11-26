@@ -3,8 +3,8 @@ import http from "http";
 import path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
-import { createCampaignApp, readCampaignState } from "./server/app";
-import { CampaignState } from "./src/types";
+import { createCampaignApp, readCampaignState } from "./api/_app.js";
+import type { CampaignState } from "./src/types.js";
 
 function getPort(): number {
   const portIndex = process.argv.indexOf("--port");

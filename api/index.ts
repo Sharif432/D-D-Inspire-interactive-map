@@ -1,4 +1,4 @@
-import { createCampaignApp } from "../server/app";
+import { createCampaignApp } from "./_app.js";
 
 const app = createCampaignApp({
   websocketEnabled: false
