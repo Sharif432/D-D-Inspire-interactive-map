@@ -3,7 +3,7 @@ import http from "http";
 import path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
-import { createCampaignApp, readCampaignState } from "./api/_app.js";
+import { createCampaignApp, readCampaignState, updateLiveViewOnly, type LiveSyncMeta } from "./api/_app.js";
 import type { CampaignState } from "./src/types.js";
 
 function getPort(): number {
@@ -57,9 +57,27 @@ function broadcastCampaignState(
   });
 }
 
+function broadcastLiveViewState(meta: LiveSyncMeta, excludeClient?: WebSocket) {
+  if (!campaignWss) return;
+  const payload = JSON.stringify({
+    type: "campaign:live-view",
+    ...meta
+  });
+  campaignWss.clients.forEach((client) => {
+    if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(payload);
+      } catch (err) {
+        console.warn("WebSocket live-view send error:", err);
+      }
+    }
+  });
+}
+
 const app = createCampaignApp({
   websocketEnabled: true,
-  onBroadcast: broadcastCampaignState
+  onBroadcast: broadcastCampaignState,
+  onLiveViewBroadcast: (meta) => broadcastLiveViewState(meta)
 });
 
 // Hot Module Replacement (HMR) and dev/prod server setup
@@ -114,6 +132,20 @@ async function startServer() {
     ws.on("message", async (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
+        if (msg?.type === "dm:live-view" && msg.liveView && typeof msg.liveView === "object") {
+          // Immediately fan out DM navigation to connected players in < 2ms, while persisting safely
+          broadcastLiveViewState(
+            {
+              stateVersion: 0,
+              currentRegionId: msg.liveView.regionId || "sword_coast",
+              partyLocationId: "",
+              liveView: msg.liveView
+            },
+            ws
+          );
+          await updateLiveViewOnly(msg.liveView);
+          return;
+        }
         if (msg?.type === "request:sync") {
           const current = await readCampaignState();
           ws.send(

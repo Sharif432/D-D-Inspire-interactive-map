@@ -183,10 +183,41 @@ export default function App() {
   };
 
   const lastVersionRef = useRef<number>(0);
+  const lastLiveViewUpdatedAtRef = useRef<string>("");
+  const wsRef = useRef<WebSocket | null>(null);
+  const isLiveSyncInFlightRef = useRef<boolean>(false);
+  const isFullFetchInFlightRef = useRef<boolean>(false);
   const stateRef = useRef<CampaignState | null>(null);
   stateRef.current = state;
   const pendingCharUpdatesRef = useRef<number>(0);
   const charUpdateQueueRef = useRef<Promise<void>>(Promise.resolve());
+
+  const applyIncomingLiveView = (payload: {
+    currentRegionId?: string;
+    partyLocationId?: string;
+    liveView?: LiveViewState | null;
+  }) => {
+    const incomingLv = payload?.liveView;
+    if (!incomingLv) return;
+    const incomingAt = incomingLv.updatedAt || "";
+    if (lastLiveViewUpdatedAtRef.current && incomingAt && incomingAt <= lastLiveViewUpdatedAtRef.current) {
+      return;
+    }
+    if (incomingAt) {
+      lastLiveViewUpdatedAtRef.current = incomingAt;
+    }
+    setState((prev) => {
+      if (!prev) return prev;
+      const nextState: CampaignState = {
+        ...prev,
+        currentRegionId: payload.currentRegionId || incomingLv.regionId || prev.currentRegionId,
+        partyLocationId: payload.partyLocationId || prev.partyLocationId,
+        liveView: incomingLv
+      };
+      stateRef.current = nextState;
+      return nextState;
+    });
+  };
 
   const applyIncomingCampaign = (nextCampaign: CampaignState | null | undefined, force = false) => {
     if (!nextCampaign) return;
@@ -200,13 +231,31 @@ export default function App() {
     if (incomingVer > lastVersionRef.current || force) {
       lastVersionRef.current = incomingVer;
     }
-    stateRef.current = nextCampaign;
-    setState(nextCampaign);
-    if (nextCampaign.campaignName) {
-      setCampaignNameInput((prev) => prev || nextCampaign.campaignName || "");
+
+    // Preserve a newer liveView already received via lightweight sync/WebSocket
+    let resolvedCampaign = nextCampaign;
+    const incomingLvAt = nextCampaign.liveView?.updatedAt || "";
+    if (
+      lastLiveViewUpdatedAtRef.current &&
+      (!incomingLvAt || incomingLvAt < lastLiveViewUpdatedAtRef.current) &&
+      stateRef.current?.liveView
+    ) {
+      resolvedCampaign = {
+        ...nextCampaign,
+        currentRegionId: stateRef.current.currentRegionId || nextCampaign.currentRegionId,
+        liveView: stateRef.current.liveView
+      };
+    } else if (incomingLvAt) {
+      lastLiveViewUpdatedAtRef.current = incomingLvAt;
     }
-    if (nextCampaign.partyName) {
-      setPartyNameInput((prev) => prev || nextCampaign.partyName || "");
+
+    stateRef.current = resolvedCampaign;
+    setState(resolvedCampaign);
+    if (resolvedCampaign.campaignName) {
+      setCampaignNameInput((prev) => prev || resolvedCampaign.campaignName || "");
+    }
+    if (resolvedCampaign.partyName) {
+      setPartyNameInput((prev) => prev || resolvedCampaign.partyName || "");
     }
   };
 
@@ -254,7 +303,9 @@ export default function App() {
 
   // Fetch complete campaign state (with automatic retry for serverless cold-starts & clear error diagnostics)
   const fetchCampaign = async (showLoader = false, attempt = 0) => {
+    if (!showLoader && isFullFetchInFlightRef.current) return;
     if (showLoader && attempt === 0) setIsLoading(true);
+    isFullFetchInFlightRef.current = true;
     let retrying = false;
     try {
       const res = await fetch("/api/campaign", { cache: "no-store" });
@@ -286,6 +337,7 @@ export default function App() {
       console.error("Campaign fetch failed:", err);
       if (showLoader && attempt < 1) {
         retrying = true;
+        isFullFetchInFlightRef.current = false;
         await new Promise((resolve) => setTimeout(resolve, 800));
         await fetchCampaign(showLoader, attempt + 1);
         return;
@@ -293,12 +345,13 @@ export default function App() {
       setErrorMessage(err?.message || "Error syncing with Campaign Server API.");
     } finally {
       if (!retrying) {
+        isFullFetchInFlightRef.current = false;
         setIsLoading(false);
       }
     }
   };
 
-  // Real-time WebSocket sync on Node/local hosts, with automatic smart polling on Vercel/serverless hosts
+  // Real-time WebSocket sync on Node/local hosts, with ultra-fast 450ms lightweight live-view polling on Vercel/serverless hosts
   useEffect(() => {
     let isUnmounted = false;
     let ws: WebSocket | null = null;
@@ -307,11 +360,37 @@ export default function App() {
     let consecutiveWsFailures = 0;
     let hasConnectedWs = false;
 
+    const syncLiveStatus = async () => {
+      if (isUnmounted || isLiveSyncInFlightRef.current) return;
+      isLiveSyncInFlightRef.current = true;
+      try {
+        const res = await fetch("/api/campaign/live-view", { cache: "no-store" });
+        if (!res.ok) return;
+        const ct = res.headers.get("content-type") || "";
+        if (!ct.includes("application/json")) return;
+        const meta = await res.json();
+        if (isUnmounted || !meta?.success) return;
+
+        if (meta.liveView) {
+          applyIncomingLiveView(meta);
+        }
+
+        const remoteVer = typeof meta.stateVersion === "number" ? meta.stateVersion : 0;
+        if (remoteVer > lastVersionRef.current) {
+          await fetchCampaign(false);
+        }
+      } catch {
+        // Ignore transient background poll errors
+      } finally {
+        isLiveSyncInFlightRef.current = false;
+      }
+    };
+
     const startPolling = (ms: number) => {
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(() => {
         if (!isUnmounted && !document.hidden) {
-          fetchCampaign(false);
+          void syncLiveStatus();
         }
       }, ms);
     };
@@ -322,20 +401,26 @@ export default function App() {
       const wsUrl = `${protocol}//${window.location.host}/ws/campaign`;
       try {
         ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
       } catch {
-        startPolling(2500);
+        startPolling(450);
         return;
       }
 
       ws.onopen = () => {
         hasConnectedWs = true;
         consecutiveWsFailures = 0;
+        wsRef.current = ws;
       };
 
       ws.onmessage = (event) => {
         if (isUnmounted) return;
         try {
           const msg = JSON.parse(event.data);
+          if (msg?.type === "campaign:live-view") {
+            applyIncomingLiveView(msg);
+            return;
+          }
           if ((msg?.type === "campaign:init" || msg?.type === "campaign:updated") && msg.campaign) {
             applyIncomingCampaign(msg.campaign, msg.type === "campaign:init");
             setIsLoading(false);
@@ -346,16 +431,17 @@ export default function App() {
       };
 
       ws.onclose = () => {
+        if (wsRef.current === ws) wsRef.current = null;
         if (isUnmounted) return;
         if (!hasConnectedWs) {
           consecutiveWsFailures += 1;
           if (consecutiveWsFailures >= 2) {
-            // Host does not support WebSockets (e.g., serverless); switch cleanly to fast HTTP polling
-            startPolling(2500);
+            // Host does not support WebSockets (e.g., serverless); switch cleanly to fast 450ms HTTP live-view polling
+            startPolling(450);
             return;
           }
         }
-        reconnectTimer = setTimeout(connectWs, 2000);
+        reconnectTimer = setTimeout(connectWs, 1500);
       };
 
       ws.onerror = () => {
@@ -366,6 +452,14 @@ export default function App() {
         }
       };
     };
+
+    const handleVisibilityOrFocus = () => {
+      if (!isUnmounted && document.visibilityState === "visible") {
+        void syncLiveStatus();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityOrFocus);
+    window.addEventListener("focus", handleVisibilityOrFocus);
 
     fetchCampaign(true);
 
@@ -379,7 +473,7 @@ export default function App() {
             setPersistenceMode(health.persistence);
           }
           if (health?.websocket === false) {
-            startPolling(2500);
+            startPolling(450);
             return;
           }
         }
@@ -388,12 +482,14 @@ export default function App() {
       }
       if (!isUnmounted) {
         connectWs();
-        startPolling(15000);
+        startPolling(10000);
       }
     })();
 
     return () => {
       isUnmounted = true;
+      document.removeEventListener("visibilitychange", handleVisibilityOrFocus);
+      window.removeEventListener("focus", handleVisibilityOrFocus);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (pollTimer) clearInterval(pollTimer);
       try {
@@ -401,6 +497,7 @@ export default function App() {
       } catch {
         // Ignore
       }
+      wsRef.current = null;
     };
   }, []);
 
@@ -563,16 +660,46 @@ export default function App() {
     }
   };
 
-  // Broadcast DM active map/room/battle view across browsers
+  // Broadcast DM active map/room/battle view across browsers (instant WS uplink + lightweight REST persist)
   const handleUpdateLiveView = async (liveView: LiveViewState) => {
+    const nowIso = new Date().toISOString();
+    const monotonicUpdatedAt =
+      lastLiveViewUpdatedAtRef.current && nowIso <= lastLiveViewUpdatedAtRef.current
+        ? new Date(Date.parse(lastLiveViewUpdatedAtRef.current) + 1).toISOString()
+        : nowIso;
+    const stampedLiveView: LiveViewState = {
+      ...liveView,
+      updatedAt: monotonicUpdatedAt
+    };
+
+    // Optimistically update local state and immediately push over open WebSocket (< 2ms)
+    applyIncomingLiveView({
+      currentRegionId: stampedLiveView.regionId,
+      liveView: stampedLiveView
+    });
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(
+          JSON.stringify({
+            type: "dm:live-view",
+            liveView: stampedLiveView
+          })
+        );
+      } catch {
+        // Fallback cleanly to HTTP POST below
+      }
+    }
+
     try {
       const res = await fetch("/api/campaign/live-view", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(liveView)
+        body: JSON.stringify(stampedLiveView)
       });
       const data = await res.json();
-      if (data.success && data.campaign) {
+      if (data?.success && data.liveView) {
+        applyIncomingLiveView(data);
+      } else if (data?.success && data.campaign) {
         applyIncomingCampaign(data.campaign);
       }
     } catch (err) {

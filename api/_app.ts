@@ -22,6 +22,7 @@ const KV_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "";
 export const HAS_KV_STORAGE = Boolean(KV_URL && KV_TOKEN);
 const KV_STATE_KEY = process.env.CAMPAIGN_KV_KEY || "aethelgard:campaign_state:v1";
+const KV_LIVE_KEY = `${KV_STATE_KEY}:live`;
 
 const BUNDLED_CAMPAIGN_FILE = path.join(process.cwd(), "campaign-data.json");
 const TMP_CAMPAIGN_FILE = "/tmp/aethelgard-campaign-data.json";
@@ -541,9 +542,27 @@ export const defaultCampaignState: CampaignState = {
   hpLogs: []
 };
 
+export interface LiveSyncMeta {
+  stateVersion: number;
+  currentRegionId: string;
+  partyLocationId: string;
+  liveView: LiveViewState | null;
+}
+
 let latestStateVersion = 1;
 let memoryCampaignCache: CampaignState | null = null;
+let memoryLiveCache: LiveSyncMeta | null = null;
 let mutationQueue: Promise<unknown> = Promise.resolve();
+let localWriteQueue: Promise<void> = Promise.resolve();
+
+function extractLiveMeta(state: CampaignState): LiveSyncMeta {
+  return {
+    stateVersion: state.stateVersion || latestStateVersion || 1,
+    currentRegionId: state.currentRegionId || "sword_coast",
+    partyLocationId: state.partyLocationId || "phandalin",
+    liveView: state.liveView || null
+  };
+}
 
 function cloneState(state: CampaignState): CampaignState {
   return JSON.parse(JSON.stringify(state)) as CampaignState;
@@ -573,12 +592,25 @@ function readLocalSeedOrFile(): CampaignState | null {
   return null;
 }
 
-function writeLocalCampaignFile(state: CampaignState): void {
+function writeLocalCampaignFileSync(state: CampaignState): void {
   try {
-    fs.writeFileSync(ACTIVE_FILE_PATH, JSON.stringify(state, null, 2), "utf-8");
+    fs.writeFileSync(ACTIVE_FILE_PATH, JSON.stringify(state), "utf-8");
   } catch (err) {
     console.error(`Error writing campaign file (${ACTIVE_FILE_PATH}):`, err);
   }
+}
+
+function enqueueLocalCampaignFileWrite(state: CampaignState): Promise<void> {
+  const serialized = JSON.stringify(state);
+  const next = localWriteQueue.then(async () => {
+    try {
+      await fs.promises.writeFile(ACTIVE_FILE_PATH, serialized, "utf-8");
+    } catch (err) {
+      console.error(`Error writing campaign file (${ACTIVE_FILE_PATH}):`, err);
+    }
+  });
+  localWriteQueue = next.catch(() => {});
+  return next;
 }
 
 async function kvGetCampaign(): Promise<CampaignState | null> {
@@ -630,32 +662,110 @@ async function kvSetCampaign(state: CampaignState): Promise<boolean> {
   }
 }
 
+async function kvGetLiveMeta(): Promise<LiveSyncMeta | null> {
+  if (!HAS_KV_STORAGE) return null;
+  try {
+    const res = await fetch(`${KV_URL.replace(/\/+$/, "")}/get/${encodeURIComponent(KV_LIVE_KEY)}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${KV_TOKEN}`
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(4000)
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { result?: string | LiveSyncMeta | null };
+    if (!data || data.result === null || data.result === undefined) return null;
+    const parsed =
+      typeof data.result === "string"
+        ? (JSON.parse(data.result) as LiveSyncMeta)
+        : (data.result as LiveSyncMeta);
+    if (parsed && typeof parsed === "object") {
+      return parsed;
+    }
+  } catch {
+    // Ignore transient KV live meta read error
+  }
+  return null;
+}
+
+async function kvSetLiveMeta(meta: LiveSyncMeta): Promise<boolean> {
+  if (!HAS_KV_STORAGE) return false;
+  try {
+    const res = await fetch(KV_URL.replace(/\/+$/, ""), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${KV_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(["SET", KV_LIVE_KEY, JSON.stringify(meta)]),
+      signal: AbortSignal.timeout(4000)
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function readLiveSyncMeta(): Promise<LiveSyncMeta> {
+  if (HAS_KV_STORAGE) {
+    const kvMeta = await kvGetLiveMeta();
+    if (kvMeta) {
+      memoryLiveCache = kvMeta;
+      return kvMeta;
+    }
+  }
+  if (memoryLiveCache && !HAS_KV_STORAGE) {
+    return memoryLiveCache;
+  }
+  const campaign = await readCampaignState();
+  const meta = extractLiveMeta(campaign);
+  memoryLiveCache = meta;
+  return meta;
+}
+
 export async function readCampaignState(): Promise<CampaignState> {
   if (HAS_KV_STORAGE) {
-    const kvState = await kvGetCampaign();
+    const [kvState, kvLive] = await Promise.all([kvGetCampaign(), kvGetLiveMeta()]);
     if (kvState) {
+      if (kvLive?.liveView?.updatedAt) {
+        const stateLvAt = kvState.liveView?.updatedAt || "";
+        if (!stateLvAt || kvLive.liveView.updatedAt > stateLvAt) {
+          kvState.liveView = kvLive.liveView;
+          if (kvLive.currentRegionId) kvState.currentRegionId = kvLive.currentRegionId;
+        }
+      }
       memoryCampaignCache = kvState;
+      memoryLiveCache = extractLiveMeta(kvState);
       return cloneState(kvState);
     }
     const seed = memoryCampaignCache || readLocalSeedOrFile() || cloneState(defaultCampaignState);
     memoryCampaignCache = seed;
-    await kvSetCampaign(seed);
+    memoryLiveCache = extractLiveMeta(seed);
+    await Promise.all([kvSetCampaign(seed), kvSetLiveMeta(memoryLiveCache)]);
     return cloneState(seed);
+  }
+
+  if (memoryCampaignCache && !IS_VERCEL) {
+    return cloneState(memoryCampaignCache);
   }
 
   const fileState = readLocalSeedOrFile();
   if (fileState) {
     memoryCampaignCache = fileState;
+    memoryLiveCache = extractLiveMeta(fileState);
     return cloneState(fileState);
   }
 
   if (memoryCampaignCache) {
+    memoryLiveCache = extractLiveMeta(memoryCampaignCache);
     return cloneState(memoryCampaignCache);
   }
 
   const fallback = cloneState(defaultCampaignState);
   memoryCampaignCache = fallback;
-  writeLocalCampaignFile(fallback);
+  memoryLiveCache = extractLiveMeta(fallback);
+  writeLocalCampaignFileSync(fallback);
   return cloneState(fallback);
 }
 
@@ -663,17 +773,65 @@ export async function persistCampaignState(state: CampaignState): Promise<Campai
   latestStateVersion = Math.max(latestStateVersion + 1, (state.stateVersion || 0) + 1);
   state.stateVersion = latestStateVersion;
   memoryCampaignCache = cloneState(state);
+  memoryLiveCache = extractLiveMeta(state);
 
   if (HAS_KV_STORAGE) {
-    const saved = await kvSetCampaign(state);
+    const [, saved] = await Promise.all([kvSetLiveMeta(memoryLiveCache), kvSetCampaign(state)]);
     if (!saved) {
-      writeLocalCampaignFile(state);
+      writeLocalCampaignFileSync(state);
     }
+  } else if (IS_VERCEL) {
+    writeLocalCampaignFileSync(state);
   } else {
-    writeLocalCampaignFile(state);
+    void enqueueLocalCampaignFileWrite(memoryCampaignCache);
   }
 
   return state;
+}
+
+export async function updateLiveViewOnly(incoming: Partial<LiveViewState>): Promise<LiveSyncMeta> {
+  const next = mutationQueue.then(async () => {
+    const campaign = await readCampaignState();
+    if (incoming.regionId) {
+      campaign.currentRegionId = incoming.regionId;
+    }
+    const nowIso = new Date().toISOString();
+    const prevUpdated = campaign.liveView?.updatedAt || "";
+    const updatedAt = incoming.updatedAt && incoming.updatedAt > prevUpdated ? incoming.updatedAt : nowIso;
+
+    campaign.liveView = {
+      regionId: incoming.regionId || campaign.currentRegionId || "sword_coast",
+      navLevel: incoming.navLevel || "realm",
+      cityLocationId: incoming.cityLocationId ?? null,
+      buildingId: incoming.buildingId ?? null,
+      battleMapLocationId: incoming.battleMapLocationId ?? null,
+      battleMapBuildingId: incoming.battleMapBuildingId ?? null,
+      activeInteriorMapId: incoming.activeInteriorMapId ?? null,
+      isBigMapOpen: !!incoming.isBigMapOpen,
+      showLines: incoming.showLines !== undefined ? incoming.showLines : true,
+      showTownNames: incoming.showTownNames !== undefined ? incoming.showTownNames : true,
+      updatedAt
+    };
+
+    if (!campaign.stateVersion) {
+      campaign.stateVersion = latestStateVersion;
+    }
+    memoryCampaignCache = campaign;
+    const meta = extractLiveMeta(campaign);
+    memoryLiveCache = meta;
+
+    if (HAS_KV_STORAGE) {
+      await Promise.all([kvSetLiveMeta(meta), kvSetCampaign(campaign)]);
+    } else if (IS_VERCEL) {
+      writeLocalCampaignFileSync(campaign);
+    } else {
+      void enqueueLocalCampaignFileWrite(campaign);
+    }
+
+    return meta;
+  });
+  mutationQueue = next.catch(() => {});
+  return next;
 }
 
 function recordHpChange(
@@ -791,6 +949,7 @@ export interface CampaignAppOptions {
     state: CampaignState,
     eventType?: "campaign:init" | "campaign:updated"
   ) => void;
+  onLiveViewBroadcast?: (payload: LiveSyncMeta) => void;
 }
 
 export function createCampaignApp(options: CampaignAppOptions = {}): Express {
@@ -1508,6 +1667,16 @@ export function createCampaignApp(options: CampaignAppOptions = {}): Express {
     })
   );
 
+  // Ultra-lightweight live view & sync version poll endpoint (~350 bytes)
+  app.get(
+    "/api/campaign/live-view",
+    asyncRoute(async (_req, res) => {
+      const meta = await readLiveSyncMeta();
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      res.json({ success: true, ...meta });
+    })
+  );
+
   // Broadcast DM live active map / room / battle view for multi-browser Player sync
   app.post(
     "/api/campaign/live-view",
@@ -1516,24 +1685,11 @@ export function createCampaignApp(options: CampaignAppOptions = {}): Express {
       if (!incoming || typeof incoming !== "object") {
         return res.status(400).json({ success: false, error: "Invalid liveView payload" });
       }
-      const campaign = await runSerializedMutation((draft) => {
-        if (incoming.regionId) draft.currentRegionId = incoming.regionId;
-        draft.liveView = {
-          regionId: incoming.regionId || draft.currentRegionId || "sword_coast",
-          navLevel: incoming.navLevel || "realm",
-          cityLocationId: incoming.cityLocationId ?? null,
-          buildingId: incoming.buildingId ?? null,
-          battleMapLocationId: incoming.battleMapLocationId ?? null,
-          battleMapBuildingId: incoming.battleMapBuildingId ?? null,
-          activeInteriorMapId: incoming.activeInteriorMapId ?? null,
-          isBigMapOpen: !!incoming.isBigMapOpen,
-          showLines: incoming.showLines !== undefined ? incoming.showLines : true,
-          showTownNames: incoming.showTownNames !== undefined ? incoming.showTownNames : true,
-          updatedAt: new Date().toISOString()
-        };
-        return { result: draft };
-      });
-      res.json({ success: true, campaign });
+      const meta = await updateLiveViewOnly(incoming);
+      if (options.onLiveViewBroadcast) {
+        options.onLiveViewBroadcast(meta);
+      }
+      res.json({ success: true, ...meta });
     })
   );
 
