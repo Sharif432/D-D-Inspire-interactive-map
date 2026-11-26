@@ -1,8 +1,9 @@
 import express, { Express, Request, Response, NextFunction } from "express";
 import path from "path";
 import fs from "fs";
-import { GoogleGenAI } from "@google/genai";
-import {
+import zlib from "zlib";
+import type { GoogleGenAI } from "@google/genai";
+import type {
   CampaignState,
   JournalNote,
   CampaignLocation,
@@ -588,7 +589,8 @@ async function kvGetCampaign(): Promise<CampaignState | null> {
       headers: {
         Authorization: `Bearer ${KV_TOKEN}`
       },
-      cache: "no-store"
+      cache: "no-store",
+      signal: AbortSignal.timeout(6000)
     });
     if (!res.ok) return null;
     const data = (await res.json()) as { result?: string | CampaignState | null };
@@ -618,7 +620,8 @@ async function kvSetCampaign(state: CampaignState): Promise<boolean> {
         Authorization: `Bearer ${KV_TOKEN}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify(["SET", KV_STATE_KEY, JSON.stringify(state)])
+      body: JSON.stringify(["SET", KV_STATE_KEY, JSON.stringify(state)]),
+      signal: AbortSignal.timeout(6000)
     });
     return res.ok;
   } catch (err) {
@@ -759,9 +762,9 @@ function syncCharacterHpEverywhere(
   });
 }
 
-// Lazy load Gemini AI to avoid crashes if GEMINI_API_KEY is not set
+// Lazy load Gemini AI to avoid crashes or cold-start overhead if GEMINI_API_KEY is not set
 let aiClient: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI {
+async function getGeminiClient(): Promise<GoogleGenAI> {
   if (!aiClient) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -769,7 +772,8 @@ function getGeminiClient(): GoogleGenAI {
         "GEMINI_API_KEY is missing. Please configure it in your environment variables."
       );
     }
-    aiClient = new GoogleGenAI({
+    const { GoogleGenAI: GenAIClass } = await import("@google/genai");
+    aiClient = new GenAIClass({
       apiKey,
       httpOptions: {
         headers: {
@@ -827,7 +831,7 @@ export function createCampaignApp(options: CampaignAppOptions = {}): Express {
     };
 
   // Healthcheck & runtime capabilities endpoint
-  app.get(["/health", "/api/health"], (_req, res) => {
+  app.get(["/health", "/api/health", "/api"], (_req, res) => {
     res.status(200).json({
       status: "healthy",
       runtime: IS_VERCEL ? "vercel" : "node",
@@ -837,13 +841,23 @@ export function createCampaignApp(options: CampaignAppOptions = {}): Express {
     });
   });
 
-  // Read complete campaign state
+  // Read complete campaign state (auto-gzipped above 256 KB to stay under serverless payload limits)
   app.get(
     "/api/campaign",
-    asyncRoute(async (_req, res) => {
+    asyncRoute(async (req, res) => {
       const data = await readCampaignState();
       res.setHeader("Cache-Control", "no-store, max-age=0");
-      res.json(data);
+      res.setHeader("Vary", "Accept-Encoding");
+      const jsonStr = JSON.stringify(data);
+      const acceptEncoding = String(req.headers["accept-encoding"] || "");
+      if (jsonStr.length > 256 * 1024 && /\bgzip\b/i.test(acceptEncoding)) {
+        const compressed = zlib.gzipSync(Buffer.from(jsonStr, "utf-8"));
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.setHeader("Content-Encoding", "gzip");
+        return res.status(200).send(compressed);
+      }
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.status(200).send(jsonStr);
     })
   );
 
@@ -1548,7 +1562,7 @@ Context or Scenario: ${promptContext || "Standard conversation in the local tave
 
 Write a short, immersive, highly in-character speaking line (1 to 3 sentences maximum, no metadata, no parentheses, no stage instructions, just the spoken words matching their class and lore!). Use rich tavern/mystic roleplay style.`;
 
-          const ai = getGeminiClient();
+          const ai = await getGeminiClient();
           const textResponse = await ai.models.generateContent({
             model: "gemini-3.5-flash",
             contents: prompt
@@ -1560,7 +1574,7 @@ Write a short, immersive, highly in-character speaking line (1 to 3 sentences ma
         textToSpeak = String(textToSpeak).replace(/^["']|["']$/g, "").trim();
         const voiceName = char.voice || "Zephyr";
 
-        const ai = getGeminiClient();
+        const ai = await getGeminiClient();
         const ttsResponse = await ai.models.generateContent({
           model: "gemini-3.1-flash-tts-preview",
           contents: [{ parts: [{ text: `Speak in a matching roleplay style: ${textToSpeak}` }] }],

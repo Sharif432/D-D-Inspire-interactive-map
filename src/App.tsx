@@ -252,20 +252,49 @@ export default function App() {
   const [newNoteCategory, setNewNoteCategory] = useState<"quest" | "lore" | "session" | "loot">("session");
   const [noteFilter, setNoteFilter] = useState<string>("all");
 
-  // Fetch complete campaign state
-  const fetchCampaign = async (showLoader = false) => {
-    if (showLoader) setIsLoading(true);
+  // Fetch complete campaign state (with automatic retry for serverless cold-starts & clear error diagnostics)
+  const fetchCampaign = async (showLoader = false, attempt = 0) => {
+    if (showLoader && attempt === 0) setIsLoading(true);
+    let retrying = false;
     try {
-      const res = await fetch("/api/campaign");
-      if (!res.ok) throw new Error("Failed to fetch campaign data");
+      const res = await fetch("/api/campaign", { cache: "no-store" });
+      const contentType = res.headers.get("content-type") || "";
+      if (!res.ok) {
+        let serverDetail = "";
+        try {
+          if (contentType.includes("application/json")) {
+            const errJson = await res.json();
+            serverDetail = errJson?.error ? `: ${errJson.error}` : "";
+          } else {
+            const snippet = (await res.text()).replace(/<[^>]+>/g, " ").trim().slice(0, 140);
+            if (snippet) serverDetail = `: ${snippet}`;
+          }
+        } catch {
+          // Ignore body parse errors
+        }
+        throw new Error(`HTTP ${res.status} (${res.statusText || "Error"}) on /api/campaign${serverDetail}`);
+      }
+      if (!contentType.includes("application/json")) {
+        throw new Error(
+          `Unexpected response type (${contentType || "unknown"}) on /api/campaign. Ensure API routing is active.`
+        );
+      }
       const data = await res.json();
       applyIncomingCampaign(data, showLoader);
       setErrorMessage(null);
     } catch (err: any) {
-      console.error(err);
-      setErrorMessage("Error sync. Ensure backend is running.");
+      console.error("Campaign fetch failed:", err);
+      if (showLoader && attempt < 1) {
+        retrying = true;
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        await fetchCampaign(showLoader, attempt + 1);
+        return;
+      }
+      setErrorMessage(err?.message || "Error syncing with Campaign Server API.");
     } finally {
-      setIsLoading(false);
+      if (!retrying) {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -957,10 +986,17 @@ export default function App() {
     return (
       <div className="min-h-screen bg-[#0c0e12] flex flex-col items-center justify-center p-6 text-center">
         <p className="text-red-400 font-mono mb-2">CRITICAL DEVICE OFFLINE ERROR</p>
-        <p className="text-xs text-slate-400">Unable to establish connection to Campaign Server API.</p>
-        <button 
+        <p className="text-xs text-slate-400 max-w-md">
+          Unable to establish connection to Campaign Server API.
+        </p>
+        {errorMessage && (
+          <p className="mt-3 px-3 py-2 rounded bg-red-950/40 border border-red-900/60 text-[11px] font-mono text-red-300 max-w-lg break-words">
+            {errorMessage}
+          </p>
+        )}
+        <button
           onClick={() => fetchCampaign(true)}
-          className="mt-4 px-4 py-2 bg-amber-600 text-white rounded text-xs uppercase cursor-pointer"
+          className="mt-4 px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded text-xs uppercase cursor-pointer"
         >
           Retry Connection Setup
         </button>
